@@ -81,6 +81,13 @@ public sealed class HostServer(int port)
     /// <summary>Captures and pushes frames. Runs sequentially so a slow client never queues up stale frames.</summary>
     private static async Task StreamLoopAsync(MessageStream stream, DxgiScreenCapture capture, CancellationToken cancellationToken)
     {
+        // Yield before doing anything else: on a quiet desktop every loop iteration can
+        // complete synchronously (null frames from the acquire timeout, inline socket
+        // writes, no throttle delay), so this method might never hit an incomplete await
+        // and therefore never return control to the caller — which would prevent
+        // ReceiveLoopAsync from ever being started.
+        await Task.Yield();
+
         while (!cancellationToken.IsCancellationRequested)
         {
             var started = Environment.TickCount64;
