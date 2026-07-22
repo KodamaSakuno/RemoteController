@@ -9,8 +9,11 @@ namespace RemoteController.Host;
 
 /// <summary>
 /// Captures the primary display via DXGI Desktop Duplication and encodes frames as JPEG.
-/// <see cref="CaptureJpeg"/> returns null when the desktop has not changed, so an idle
-/// desktop costs neither bandwidth nor encode CPU. Windows 8+ only.
+/// Acquired frames arrive in the panel's native scanout orientation; when the display runs
+/// in a rotated mode (e.g. a portrait panel set to landscape) they are rotated back to the
+/// desktop orientation before encoding. <see cref="CaptureJpeg"/> returns null when the
+/// desktop has not changed, so an idle desktop costs neither bandwidth nor encode CPU.
+/// Windows 8+ only.
 /// </summary>
 public sealed class DxgiScreenCapture : IDisposable
 {
@@ -28,6 +31,10 @@ public sealed class DxgiScreenCapture : IDisposable
     private ID3D11Texture2D? _staging;
     private Bitmap? _encodeBuffer;
 
+    private ModeRotation _rotation;
+    private int _rawWidth;
+    private int _rawHeight;
+
     public DxgiScreenCapture(long quality = 70)
     {
         _jpegParams = new EncoderParameters(1);
@@ -39,9 +46,10 @@ public sealed class DxgiScreenCapture : IDisposable
         RecreateDuplication();
     }
 
-    /// <summary>Primary display size in physical pixels.</summary>
+    /// <summary>Primary display size in physical pixels, in the desktop's orientation.</summary>
     public int Width { get; private set; }
 
+    /// <summary>Primary display size in physical pixels, in the desktop's orientation.</summary>
     public int Height { get; private set; }
 
     /// <summary>
@@ -132,9 +140,6 @@ public sealed class DxgiScreenCapture : IDisposable
                                 out ID3D11DeviceContext? context)
                             .CheckError();
 
-                        if (output.Description.Rotation != ModeRotation.Identity)
-                            Console.WriteLine("[Host] WARNING: display rotation is not supported, frames will appear rotated.");
-
                         return (device!, context!, output.QueryInterface<IDXGIOutput1>());
                     }
                 }
@@ -148,22 +153,35 @@ public sealed class DxgiScreenCapture : IDisposable
     {
         _duplication?.Dispose();
         _duplication = _output.DuplicateOutput(_device);
+
+        // Acquired frames are in the panel's native scanout orientation. When the display
+        // runs rotated, they must be rotated by the named amount to match the desktop.
+        _rotation = _duplication.Description.Rotation;
+        if (_rotation is not (ModeRotation.Identity or ModeRotation.Unspecified))
+            Console.WriteLine($"[Host] Display rotation is {_rotation}; frames will be rotated to the desktop orientation.");
     }
 
-    private void EnsureBuffers(int width, int height)
+    private void EnsureBuffers(int rawWidth, int rawHeight)
     {
-        if (_staging is not null && Width == width && Height == height)
+        if (_staging is not null && _rawWidth == rawWidth && _rawHeight == rawHeight)
             return;
 
         _staging?.Dispose();
         _encodeBuffer?.Dispose();
 
-        Width = width;
-        Height = height;
+        _rawWidth = rawWidth;
+        _rawHeight = rawHeight;
+
+        // The public dimensions are in the desktop's orientation, which is what the
+        // handshake reports and what input coordinates are mapped against.
+        var swapped = _rotation is ModeRotation.Rotate90 or ModeRotation.Rotate270;
+        Width = swapped ? rawHeight : rawWidth;
+        Height = swapped ? rawWidth : rawHeight;
+
         _staging = _device.CreateTexture2D(new Texture2DDescription
         {
-            Width = (uint)width,
-            Height = (uint)height,
+            Width = (uint)rawWidth,
+            Height = (uint)rawHeight,
             MipLevels = 1,
             ArraySize = 1,
             Format = Format.B8G8R8A8_UNorm,
@@ -172,7 +190,9 @@ public sealed class DxgiScreenCapture : IDisposable
             BindFlags = BindFlags.None,
             CPUAccessFlags = CpuAccessFlags.Read,
         });
-        _encodeBuffer = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+        // The encode buffer holds the corrected (desktop-oriented) image, so its
+        // dimensions stay stable across frames even when a rotation is applied.
+        _encodeBuffer = new Bitmap(Width, Height, PixelFormat.Format32bppArgb);
     }
 
     private byte[] EncodeFrame()
@@ -184,14 +204,23 @@ public sealed class DxgiScreenCapture : IDisposable
                 new Rectangle(0, 0, Width, Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
             try
             {
-                // DXGI gives BGRA rows, which is exactly Format32bppArgb's layout.
-                var rowBytes = Width * 4;
                 unsafe
                 {
-                    var src = (byte*)map.DataPointer;
-                    var dst = (byte*)data.Scan0;
-                    for (var y = 0; y < Height; y++)
-                        Buffer.MemoryCopy(src + y * map.RowPitch, dst + y * data.Stride, rowBytes, rowBytes);
+                    if (_rotation is ModeRotation.Identity or ModeRotation.Unspecified)
+                    {
+                        // DXGI gives BGRA rows, which is exactly Format32bppArgb's layout.
+                        var rowBytes = _rawWidth * 4;
+                        var src = (byte*)map.DataPointer;
+                        var dst = (byte*)data.Scan0;
+                        for (var y = 0; y < _rawHeight; y++)
+                            Buffer.MemoryCopy(src + y * map.RowPitch, dst + y * data.Stride, rowBytes, rowBytes);
+                    }
+                    else
+                    {
+                        // Rotated display: rotate the scanout-oriented pixels into the
+                        // desktop orientation while copying.
+                        RotateInto((byte*)map.DataPointer, (int)map.RowPitch, (byte*)data.Scan0, data.Stride);
+                    }
                 }
             }
             finally
@@ -207,5 +236,40 @@ public sealed class DxgiScreenCapture : IDisposable
         using var ms = new MemoryStream();
         _encodeBuffer!.Save(ms, JpegCodec, _jpegParams);
         return ms.ToArray();
+    }
+
+    /// <summary>
+    /// Copies the raw (scanout-oriented) frame into the corrected-dims encode buffer,
+    /// rotating 32bpp pixels by the display's rotation. Pitches are in bytes and are
+    /// always multiples of 4 for a 32bpp layout.
+    /// </summary>
+    private unsafe void RotateInto(byte* src, int srcPitch, byte* dst, int dstStride)
+    {
+        var s = (uint*)src;
+        var d = (uint*)dst;
+        var sp = srcPitch / 4;
+        var dp = dstStride / 4;
+
+        switch (_rotation)
+        {
+            // D(x, y) = S(y, rawHeight-1-x): the source's bottom-left corner lands top-left.
+            case ModeRotation.Rotate90:
+                for (var y = 0; y < Height; y++)
+                for (var x = 0; x < Width; x++)
+                    d[y * dp + x] = s[(_rawHeight - 1 - x) * sp + y];
+                break;
+            // D(x, y) = S(rawWidth-1-y, x): the source's top-right corner lands top-left.
+            case ModeRotation.Rotate270:
+                for (var y = 0; y < Height; y++)
+                for (var x = 0; x < Width; x++)
+                    d[y * dp + x] = s[x * sp + (_rawWidth - 1 - y)];
+                break;
+            // D(x, y) = S(rawWidth-1-x, rawHeight-1-y)
+            case ModeRotation.Rotate180:
+                for (var y = 0; y < Height; y++)
+                for (var x = 0; x < Width; x++)
+                    d[y * dp + x] = s[(_rawHeight - 1 - y) * sp + (_rawWidth - 1 - x)];
+                break;
+        }
     }
 }
