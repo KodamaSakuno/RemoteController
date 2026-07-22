@@ -1,3 +1,5 @@
 <Solution>
   <Project Path="RemoteController.Client/RemoteController.Client.csproj" />
+  <Project Path="RemoteController.Host/RemoteController.Host.csproj" />
+  <Project Path="RemoteController.Shared/RemoteController.Shared.csproj" />
 </Solution>

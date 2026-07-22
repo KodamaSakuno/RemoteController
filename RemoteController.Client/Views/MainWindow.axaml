@@ -3,20 +3,34 @@
         xmlns:vm="using:RemoteController.Client.ViewModels"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
-        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+        mc:Ignorable="d" d:DesignWidth="1280" d:DesignHeight="800"
         x:Class="RemoteController.Client.Views.MainWindow"
         x:DataType="vm:MainViewModel"
+        Width="1280" Height="800"
         Icon="/Assets/avalonia-logo.ico"
-        Title="RemoteController.Client">
+        Title="Remote Controller">
 
     <Design.DataContext>
-        <!-- This only sets the DataContext for the previewer in an IDE,
-             to set the actual DataContext for runtime, set the DataContext property in code (look at App.axaml.cs) -->
         <vm:MainViewModel />
     </Design.DataContext>
 
-    <TextBox Text="{Binding Greeting}"
-             HorizontalAlignment="Center"
-             VerticalAlignment="Center" />
+    <Grid RowDefinitions="Auto,*">
+        <Grid Grid.Row="0" ColumnDefinitions="2*,Auto,Auto,Auto,*" Margin="8">
+            <TextBox Grid.Column="0" Text="{Binding Address}" PlaceholderText="被控端 IP 地址"
+                     VerticalContentAlignment="Center" />
+            <TextBox Grid.Column="1" Text="{Binding Port}" PlaceholderText="端口" Width="90"
+                     Margin="8,0,0,0" VerticalContentAlignment="Center" />
+            <Button Grid.Column="2" Content="连接" Command="{Binding ConnectCommand}" Margin="8,0,0,0" />
+            <Button Grid.Column="3" Content="断开" Command="{Binding DisconnectCommand}" Margin="8,0,0,0" />
+            <TextBlock Grid.Column="4" Text="{Binding Status}" VerticalAlignment="Center" Margin="12,0,0,0" />
+        </Grid>
+
+        <Border Grid.Row="1" Background="Black">
+            <Image x:Name="RemoteImage"
+                   Source="{Binding CurrentFrame}"
+                   Stretch="Uniform"
+                   Focusable="True" />
+        </Border>
+    </Grid>
 
 </Window>
