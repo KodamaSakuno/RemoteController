@@ -7,7 +7,7 @@ for (var i = 0; i + 1 < args.Length; i++)
         port = parsed;
 }
 
-ScreenCapture.EnsureDpiAwareness();
+DxgiScreenCapture.EnsureDpiAwareness();
 
 Console.WriteLine("RemoteController.Host — LAN remote-control host (screen + input)");
 await new HostServer(port).RunAsync();

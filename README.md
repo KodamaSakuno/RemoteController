@@ -9,7 +9,7 @@
 | 项目 | 说明 |
 | --- | --- |
 | `RemoteController.Shared` | 二进制协议（长度前缀分帧）与消息读写，被双方引用 |
-| `RemoteController.Host` | 被控端（仅 Windows）：GDI 抓屏 → JPEG 推流，`SendInput` 注入键鼠 |
+| `RemoteController.Host` | 被控端（仅 Windows）：DXGI Desktop Duplication 抓屏 → JPEG 推流，`SendInput` 注入键鼠 |
 | `RemoteController.Client` | 控制端（Avalonia + ReactiveUI）：连接、显示画面、采集键鼠转发 |
 
 ## 使用
@@ -33,10 +33,10 @@ dotnet run --project RemoteController.Client
 `[int32 bodyLength][byte messageType][payload]`
 
 - 握手：Client → `ClientHello(version)`；Host → `ServerHello(version, width, height)`
-- 推流：Host 持续推送 `Frame(width, height, jpeg)`，约 30 FPS 上限（GDI+JPEG 实测 1080p 约 15 FPS）
+- 推流：Host 推送 `Frame(width, height, jpeg)`，约 30 FPS 上限；基于 DXGI Desktop Duplication，画面无变化时不推帧（空闲零带宽、零编码开销）
 - 输入：`MouseMove(x,y)` / `MouseButton(btn,down)` / `MouseWheel(steps)` / `KeyEvent(vk,down)`，坐标为远端物理像素，键盘为 Windows VK 码
 
 ## 已知限制 / 后续方向
 
-- 仅主显示器；无鉴权加密；无剪贴板/文件传输
-- 采集可升级 DXGI Desktop Duplication，编码可升级差量帧/H.264；跨公网需中继或打洞
+- 仅主显示器；无鉴权加密；无剪贴板/文件传输；显示器旋转场景画面不矫正
+- 编码可升级差量帧/H.264；跨公网需中继或打洞

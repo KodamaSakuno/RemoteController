@@ -48,9 +48,9 @@ public sealed class HostServer(int port)
                 if (await stream.ReadAsync() is not ClientHelloMessage hello || hello.Version != ProtocolInfo.Version)
                     throw new InvalidDataException("Bad handshake from client.");
 
-                using var capture = new ScreenCapture();
-                var screenWidth = ScreenCapture.PrimaryScreenWidth;
-                var screenHeight = ScreenCapture.PrimaryScreenHeight;
+                using var capture = new DxgiScreenCapture();
+                var screenWidth = capture.Width;
+                var screenHeight = capture.Height;
                 await stream.WriteAsync(new ServerHelloMessage(ProtocolInfo.Version, screenWidth, screenHeight));
                 Console.WriteLine($"[Host] Streaming {screenWidth}x{screenHeight} to {endpoint}");
 
@@ -79,19 +79,23 @@ public sealed class HostServer(int port)
     }
 
     /// <summary>Captures and pushes frames. Runs sequentially so a slow client never queues up stale frames.</summary>
-    private static async Task StreamLoopAsync(MessageStream stream, ScreenCapture capture, CancellationToken cancellationToken)
+    private static async Task StreamLoopAsync(MessageStream stream, DxgiScreenCapture capture, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             var started = Environment.TickCount64;
 
-            var jpeg = capture.CaptureJpeg(out var width, out var height);
-            await stream.WriteAsync(new FrameMessage(width, height, jpeg), cancellationToken);
+            // Null means the desktop did not change (AcquireNextFrame already blocked ~100ms),
+            // so an idle desktop sends nothing at all.
+            if (capture.CaptureJpeg() is { } jpeg)
+            {
+                await stream.WriteAsync(new FrameMessage(capture.Width, capture.Height, jpeg), cancellationToken);
 
-            var elapsed = (int)(Environment.TickCount64 - started);
-            var delay = FrameIntervalMs - elapsed;
-            if (delay > 0)
-                await Task.Delay(delay, cancellationToken);
+                var elapsed = (int)(Environment.TickCount64 - started);
+                var delay = FrameIntervalMs - elapsed;
+                if (delay > 0)
+                    await Task.Delay(delay, cancellationToken);
+            }
         }
     }
 
