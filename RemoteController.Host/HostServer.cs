@@ -102,6 +102,7 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
         await Task.Yield();
 
         var useGpu = true;
+        var gpuConversionFailed = false;
         var encoder = NewEncoder(useGpu);
 
         H264Encoder NewEncoder(bool gpu)
@@ -155,7 +156,25 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
 
                 if (outputs is null && !useGpu)
                 {
-                    if (capture.CaptureNv12() is { } nv12)
+                    // GPU-assisted NV12 conversion (render + plane readback) is cheaper than
+                    // a full BGRA readback plus per-pixel CPU conversion; the pure-CPU path
+                    // stays as the fallback.
+                    byte[]? nv12 = null;
+                    if (!gpuConversionFailed)
+                    {
+                        try
+                        {
+                            nv12 = capture.CaptureNv12Gpu();
+                        }
+                        catch (Exception ex)
+                        {
+                            gpuConversionFailed = true;
+                            Console.WriteLine($"[Host] GPU NV12 conversion failed ({ex.Message}); using CPU conversion.");
+                        }
+                    }
+
+                    nv12 ??= capture.CaptureNv12();
+                    if (nv12 is not null)
                         outputs = encoder.Encode(nv12, timestamp, 333_333);
                 }
 

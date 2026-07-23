@@ -349,8 +349,10 @@ public sealed class H264Encoder : IDisposable
         transform.SetOutputType(0, VideoType(VideoFormatGuids.H264, width, height, fps, bitrate), 0);
 
         // See what input formats the encoder takes: RGB32 means BGRA textures can be fed
-        // as-is and the whole NV12 conversion step disappears (hardware MFTs only; the
-        // sync software encoder stays on NV12 so the CPU path stays valid).
+        // as-is and the whole NV12 conversion step disappears. Only negotiate it when a
+        // D3D device is actually available — the system-memory fallback always feeds NV12,
+        // so a device-less encoder must end up with an NV12 input type. (Hardware MFTs
+        // only; the sync software encoder stays on NV12 so the CPU path stays valid.)
         Guid inputSubtype = VideoFormatGuids.NV12;
         IMFMediaType? rgbInput = null;
         for (var i = 0; ; i++)
@@ -361,7 +363,7 @@ public sealed class H264Encoder : IDisposable
 
             var subtype = offered.GetGUID(MediaTypeAttributeKeys.Subtype);
             Console.WriteLine($"[Host] encoder input type offered: {subtype}");
-            if (isAsync && (subtype == VideoFormatGuids.Rgb32 || subtype == VideoFormatGuids.Argb32))
+            if (isAsync && device is not null && (subtype == VideoFormatGuids.Rgb32 || subtype == VideoFormatGuids.Argb32))
                 rgbInput ??= offered;
         }
 

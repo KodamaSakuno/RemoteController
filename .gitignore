@@ -3,6 +3,9 @@
 ##
 ## Get latest from `dotnet new gitignore`
 
+# Local scratch tools (diagnostics, per AGENTS.md)
+.scratch/
+
 # dotenv files
 .env
 

@@ -10,12 +10,14 @@ namespace RemoteController.Host;
 /// Captures the primary display via DXGI Desktop Duplication. Acquired frames arrive in
 /// the panel's native scanout orientation; when the display runs in a rotated mode (e.g.
 /// a portrait panel set to landscape) they are rotated back to the desktop orientation on
-/// the GPU. Two output paths:
+/// the GPU. Output paths:
 /// <see cref="CaptureFrame"/> renders the frame into an NV12 texture entirely on the GPU
-/// (for hardware encoder MFTs fed via DXGI surfaces); <see cref="CaptureNv12"/> reads back
-/// and converts on the CPU (for the software encoder MFT, which takes system memory).
-/// Both return null when the desktop has not changed, so an idle desktop costs neither
-/// bandwidth nor encode CPU. Windows 8+ only.
+/// (for hardware encoder MFTs fed via DXGI surfaces); <see cref="CaptureBgra"/> does the
+/// same into a BGRA texture (for encoders that accept RGB32 input directly);
+/// <see cref="CaptureNv12Gpu"/> renders NV12 on the GPU and reads the planes back (for
+/// encoder MFTs that take system memory only); <see cref="CaptureNv12"/> reads back and
+/// converts on the CPU (last-resort fallback). All return null when the desktop has not
+/// changed, so an idle desktop costs neither bandwidth nor encode CPU. Windows 8+ only.
 /// </summary>
 public sealed class DxgiScreenCapture : IDisposable
 {
@@ -77,6 +79,8 @@ public sealed class DxgiScreenCapture : IDisposable
 
     private IDXGIOutputDuplication? _duplication;
     private ID3D11Texture2D? _staging;
+    private ID3D11Texture2D? _yStaging;
+    private ID3D11Texture2D? _uvStaging;
     private byte[]? _nv12;
 
     // NV12 textures handed to the encoder; pooled because the MFT may still reference a
@@ -167,6 +171,63 @@ public sealed class DxgiScreenCapture : IDisposable
         _context.CopyResource(_staging!, source);
         return ReadbackNv12();
     });
+
+    /// <summary>
+    /// Captures the next desktop update as NV12 in system memory with the conversion done
+    /// on the GPU: luma and chroma are rendered into R8/R8G8 plane textures (as in
+    /// <see cref="CaptureFrame"/>), then copied out through single-plane staging textures.
+    /// Compared to <see cref="CaptureNv12"/> this reads back 1.5 bytes/pixel instead of 4
+    /// and replaces the per-pixel CPU conversion with plane memcpys — the cheaper way to
+    /// feed encoders that only accept system memory (e.g. Qualcomm's MFT, which rejects
+    /// every DXGI surface form). The returned buffer is reused on the next call.
+    /// </summary>
+    public byte[]? CaptureNv12Gpu() => WithFrame(texture =>
+    {
+        var source = texture;
+        if (_rotation is not (ModeRotation.Identity or ModeRotation.Unspecified))
+        {
+            RotateFrame(texture, _rotated!, _rotatedRtv!);
+            source = _rotated!;
+        }
+
+        // Draw into pool slot 0 and read back via the single-plane R8/R8G8 staging
+        // textures — planar (NV12) staging fed from a keyed-mutex texture proved to be
+        // an E_INVALIDARG minefield; single-plane staging maps cleanly everywhere.
+        DrawNv12Planes(source, 0);
+        _context.CopyResource(_yStaging!, _yPlanePool[0]);
+        _context.CopyResource(_uvStaging!, _uvPlanePool[0]);
+        return ReadbackNv12Planes();
+    });
+
+    /// <summary>Maps the staging plane textures and copies both planes out contiguously.</summary>
+    private byte[] ReadbackNv12Planes()
+    {
+        var nv12 = _nv12!;
+        CopyPlane(_yStaging!, 0, Height);                   // Y: Height rows of Width bytes
+        CopyPlane(_uvStaging!, Width * Height, Height / 2); // UV: Height/2 rows of Width bytes
+        return nv12;
+
+        void CopyPlane(ID3D11Texture2D staging, int dstOffset, int rows)
+        {
+            var map = _context.Map(staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+            try
+            {
+                unsafe
+                {
+                    var src = (byte*)map.DataPointer;
+                    fixed (byte* dst = &nv12[dstOffset])
+                    {
+                        for (var y = 0; y < rows; y++)
+                            Buffer.MemoryCopy(src + y * map.RowPitch, dst + y * Width, Width, Width);
+                    }
+                }
+            }
+            finally
+            {
+                _context.Unmap(staging, 0);
+            }
+        }
+    }
 
     /// <summary>
     /// Captures the next desktop update as a plain BGRA texture (rotation applied), pooled
@@ -276,6 +337,8 @@ public sealed class DxgiScreenCapture : IDisposable
     {
         _duplication?.Dispose();
         _staging?.Dispose();
+        _yStaging?.Dispose();
+        _uvStaging?.Dispose();
         for (var i = 0; i < Nv12PoolSize; i++)
         {
             _yRtvs[i]?.Dispose();
@@ -357,6 +420,10 @@ public sealed class DxgiScreenCapture : IDisposable
             return;
 
         _staging?.Dispose();
+        _yStaging?.Dispose();
+        _uvStaging?.Dispose();
+        _yStaging = null;
+        _uvStaging = null;
         _rotatedRtv?.Dispose();
         _rotated?.Dispose();
         _rotatedRtv = null;
@@ -387,6 +454,33 @@ public sealed class DxgiScreenCapture : IDisposable
             MipLevels = 1,
             ArraySize = 1,
             Format = Format.B8G8R8A8_UNorm,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Staging,
+            BindFlags = BindFlags.None,
+            CPUAccessFlags = CpuAccessFlags.Read,
+        });
+
+        // Readback targets for the GPU-converted NV12 frame, one staging texture per
+        // plane (single-plane staging maps cleanly; planar staging proved fragile).
+        _yStaging = _device.CreateTexture2D(new Texture2DDescription
+        {
+            Width = (uint)Width,
+            Height = (uint)Height,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = Format.R8_UNorm,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Staging,
+            BindFlags = BindFlags.None,
+            CPUAccessFlags = CpuAccessFlags.Read,
+        });
+        _uvStaging = _device.CreateTexture2D(new Texture2DDescription
+        {
+            Width = (uint)(Width / 2),
+            Height = (uint)(Height / 2),
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = Format.R8G8_UNorm,
             SampleDescription = new SampleDescription(1, 0),
             Usage = ResourceUsage.Staging,
             BindFlags = BindFlags.None,
@@ -485,6 +579,20 @@ public sealed class DxgiScreenCapture : IDisposable
     /// <summary>Renders the frame into the next pooled NV12 texture (identity UVs).</summary>
     private ID3D11Texture2D ConvertToNv12(ID3D11Texture2D source)
     {
+        var index = _nv12Index;
+        _nv12Index = (_nv12Index + 1) % Nv12PoolSize;
+
+        DrawNv12Planes(source, index);
+        _context.CopySubresourceRegion(_nv12Pool[index]!, 0, 0, 0, 0, _yPlanePool[index]!, 0, null);
+        _context.CopySubresourceRegion(_nv12Pool[index]!, 1, 0, 0, 0, _uvPlanePool[index]!, 0, null);
+        return _nv12Pool[index]!;
+    }
+
+    /// <summary>Renders luma and chroma of <paramref name="source"/> into a pool slot's
+    /// R8/R8G8 plane textures (universally renderable — Adreno rejects NV12 at draw time).
+    /// The planes can then be copied into an NV12 texture or read back directly.</summary>
+    private void DrawNv12Planes(ID3D11Texture2D source, int index)
+    {
         EnsureQuadResources();
         if (_identityQuadVertices is null)
             _identityQuadVertices = CreateQuadVertices(
@@ -493,15 +601,10 @@ public sealed class DxgiScreenCapture : IDisposable
         var stage = "source view";
         try
         {
-            var index = _nv12Index;
-            _nv12Index = (_nv12Index + 1) % Nv12PoolSize;
-
             using var view = _device.CreateShaderResourceView(source);
             stage = "quad state";
             BeginQuad(view, _identityQuadVertices!);
 
-            // Render into plain R8/R8G8 plane textures (universally renderable), then
-            // copy the planes into the NV12 texture — Adreno rejects NV12 at draw time.
             stage = "luma draw";
             _context.PSSetShader(_lumaShader!);
             _context.OMSetRenderTargets(_yRtvs[index]!);
@@ -513,12 +616,6 @@ public sealed class DxgiScreenCapture : IDisposable
             _context.OMSetRenderTargets(_uvRtvs[index]!);
             _context.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, Width / 2, Height / 2));
             _context.Draw(6, 0);
-
-            stage = "plane copy";
-            _context.CopySubresourceRegion(_nv12Pool[index]!, 0, 0, 0, 0, _yPlanePool[index]!, 0, null);
-            _context.CopySubresourceRegion(_nv12Pool[index]!, 1, 0, 0, 0, _uvPlanePool[index]!, 0, null);
-
-            return _nv12Pool[index]!;
         }
         catch (Exception ex)
         {

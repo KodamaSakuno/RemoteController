@@ -25,8 +25,9 @@ dotnet run --project RemoteController.Client
 
 ## 本地验证回路（重要）
 
-- **裸协议探针**（`.scratch/probe`，控制台，需自建）：TcpClient + `MessageStream` 握手收帧 → MF 解码校验帧数。用于不依赖 GUI 的快速回归。
+- **裸协议探针**（`.scratch/probe`，控制台，已 gitignore）：`--stream [port] [秒]` 连 Host 握手收帧、校验首帧 SPS/PPS/IDR 结构并报 fps/码率；`--dump [目录]` 各抓一帧 `CaptureNv12Gpu`/`CaptureNv12` 写成 PNG 并比对两路 NV12 逐字节差（转换正确性回归）。用于不依赖 GUI 的快速回归。
 - **无头基准**：`Avalonia.Headless` 起无窗客户端跑真实接收-解码-显示路径（初始化后必须 `SynchronizationContext.SetSynchronizationContext(null)`，否则 await 全部挂死）。
+- **表面接受矩阵探针**（`tools/SurfaceProbe`，已入库）：对首个硬件 H.264 编码 MFT 跑"完整 MFT 仪式"（async 解锁 → 协商 → D3D 管理器 → BeginStreaming → NeedInput 门控 → ProcessInput → drain）下的纹理形态矩阵（bind/misc 标志 × NV12/P010 × 采样创建方式 × 设备变体）加判别实验（manager 对内存输入的影响、LockDevice、feature level）。改捕获/编码路径前先跑它。
 - 调试经验：**凡是跨端/驱动相关问题，先打"阶段标签"日志**（每个可疑调用一段 `stage` 字符串，异常时带出来），一次定位，拒绝盲猜。
 
 ## 平台知识库（全是踩过的坑，症状 → 根因 → 修法）
@@ -51,18 +52,20 @@ dotnet run --project RemoteController.Client
 13. **自建纹理要 SRV 就必须有 `D3D11_BIND_SHADER_RESOURCE`**：Intel 宽松放行，Adreno（骁龙平板）严格校验报 `E_INVALIDARG`。旋转用的 `_rotated` 需要 `RenderTarget|ShaderResource`。
 14. **Adreno 不接受 NV12 作为绘制目标**：改为渲到 R8/R8G8 平面纹理再 `CopySubresourceRegion` 进 NV12 平面。
 15. **设过 D3D 管理器的 MFT 不再接受系统内存输入**（native 0xC0000005 崩溃）。GPU 路径失败回退 CPU 时必须**新建一个不带管理器的编码器**，不能只翻标志位。
+16. **NV12 读回别走 planar staging**：NV12 staging 纹理配 keyed-mutex 源拷贝是 `E_INVALIDARG` 雷区。ffmpeg（hwcontext_d3d11va）也只 map 子资源 0 当整块 blob 读。本项目用两个单平面 staging（R8 + R8G8）分别 map，最稳。
 
 ### 设备差异（实测）
 
 - **Intel（本机）**：编码/解码一切正常；接受 ARGB32 输入（直接喂 BGRA，零色彩转换，已走通）。NVIDIA H.264 编码 MFT 在 `SetOutputType` 报 `E_UNEXPECTED`，不可用（跳过即可）。
-- **QCOM（骁龙平板）**：编码器 "QCOM Hardware Encoder - H264"，async、接受 D3D 管理器、接受低延迟/B=0/GOP 属性；输入只有 NV12 和 P010（无 RGB32）；**`MFCreateDXGISurfaceBuffer`/`ProcessInput` 对我们的 NV12 纹理报 `E_INVALIDARG`（未解决）**，已排除：ShaderResource 标志、纯 RenderTarget、VideoEncoder 标志（反而有害）、Shared 标志。OBS 在同设备 h264_mf 硬编 2560×1600@60 正常，理论上 QCOM 接受正确形态的 NV12 surface，差异点待查（见下）。
+- **QCOM（骁龙平板）**：编码器 "QCOM Hardware Encoder - H264"，async、接受 D3D 管理器、接受低延迟/B=0/GOP 属性；输入只有 NV12 和 P010（无 RGB32）。**纹理输入已定论：不可用。** `tools/SurfaceProbe`（完整 MFT 仪式 + 事件门控）实测：17 种纹理形态（bind/misc 全组合、Shared/KeyedMutex/NTHandle、VideoEncoder、VideoSupport/宽 feature-level 设备）× 两种采样创建（`MFCreateDXGISurfaceBuffer`、`MFCreateVideoSampleFromSurface`）全部在 `ProcessInput` 报 `E_INVALIDARG`；`MF_SA_D3D11_AWARE=1` 形同虚设；无 `IMFVideoSampleAllocator`；manager 设备不被掉包；stream id 默认 0/0；LockDevice 无效。判别实验：同一 manager 下**内存输入正常**——manager 无毒，毒的就是 surface 输入本身。推论：OBS 的 h264_mf 走 ffmpeg obs-ffmpeg 路径（内存帧），"OBS 正常"从未证明过纹理输入可用。ffmpeg 源码佐证其 D3D11 纹理池 `BindFlags=0/RenderTarget、MiscFlags=0`（ddagrab），与探测矩阵一致。
 - **客户端（x64 PC）**：微软软解（无硬解 MFT 可用）+ `AVLowLatencyMode` 后零滞留；NV12→BGRA 转换已 `Parallel.For` 行并行（~3ms/帧@1080p）。
 
 ## 当前状态
 
-- **CPU 路径全链路工作**（所有设备）：抓屏 → GPU 旋转 → 读回并行转 NV12 → 编码推流 → 解码显示，30fps，亚秒延迟（平板建议 `--fps 20 --bitrate 10`）。
-- **GPU 路径（零拷贝喂纹理）**：Intel 上走通（RGB32 直接喂）；QCOM 上 `surface sample feed failed: E_INVALIDARG` 未解决，自动安全回退 CPU 路径（重建编码器，不崩）。
-- QCOM 纹理排查现场：`H264Encoder.Encode(ID3D11Texture2D)`（标签 "surface sample feed failed"），纹理在 `DxgiScreenCapture.EnsureBuffers` 的 `_nv12Pool`（NV12、Default、RenderTarget、SharedKeyedMutex）。下一步候选：调查 OBS 实际喂给 MFT 的纹理形态（`obs-d3d11` 源码/RenderDoc 抓包）；`MFCreateVideoSampleFromSurface` 或由管理器分配 surface；或确认用户 OBS 测试时是否真的走了纹理输入（可能实际是内存输入）。
+- **CPU 路径全链路工作**（所有设备）：抓屏 → GPU 旋转 → **GPU 渲染 NV12 + 单平面读回**（1.5 字节/像素、纯 memcpy，替代原 BGRA 读回 + CPU 逐像素转换）→ 编码推流 → 解码显示，亚秒延迟（平板建议 `--fps 20 --bitrate 10`）。GPU 转换失败时自动回退纯 CPU 转换（`CaptureNv12`）。
+- **GPU 路径（零拷贝喂纹理）**：Intel 上走通（RGB32 直接喂）；QCOM 已由探针定论不支持表面输入，自动安全回退 CPU 路径（重建编码器，不崩）。
+- RGB32 输入只在传入 D3D 设备时协商：无设备的回退编码器固定 NV12 输入，与内存喂帧路径保持一致。
+- QCOM 纹理问题已结案（见"设备差异"）：非配置问题，是该 MFT 驱动根本不接受 DXGI 表面输入；零拷贝念想止步于此，GPU NV12 渲染 + 读回是该设备的最优形态。
 
 ## 约定
 
