@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using SharpGen.Runtime;
+using Vortice.Direct3D11;
 using Vortice.MediaFoundation;
 
 namespace RemoteController.Host;
@@ -25,11 +26,15 @@ public sealed class H264Encoder : IDisposable
     // MFT_FRIENDLY_NAME_Attribute
     private static readonly Guid MftFriendlyNameKey = new("314ffbae-5b41-4c95-9c19-4e7d586face3");
 
+    // IID_ID3D11Texture2D, for MFCreateDXGISurfaceBuffer.
+    private static readonly Guid Texture2DIid = new("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
+
     private static readonly object MfStartupLock = new();
     private static bool _mfStarted;
 
     private readonly IMFTransform _transform;
     private readonly IMFMediaEventGenerator? _events;
+    private readonly IMFDXGIDeviceManager? _dxgiManager;
     private readonly int _width;
     private readonly int _height;
     private readonly int _fps;
@@ -45,7 +50,13 @@ public sealed class H264Encoder : IDisposable
     // grows memory and latency without limit).
     private const int MaxPendingFrames = 8;
 
-    public H264Encoder(int width, int height, int fps, uint bitrate)
+    /// <summary>True when the encoder takes D3D11 textures directly (GPU frame path).</summary>
+    public bool GpuInput => _dxgiManager is not null;
+
+    /// <summary>True when the negotiated encoder input is RGB32 (plain BGRA, no color conversion).</summary>
+    public bool InputIsRgb32 { get; private set; }
+
+    public H264Encoder(int width, int height, int fps, uint bitrate, ID3D11Device? device = null)
     {
         lock (MfStartupLock)
         {
@@ -60,7 +71,7 @@ public sealed class H264Encoder : IDisposable
         _height = height;
         _fps = fps;
         _bitrate = bitrate;
-        (_transform, _events) = CreateTransform(width, height, fps, bitrate);
+        (_transform, _events, _dxgiManager, InputIsRgb32) = CreateTransform(width, height, fps, bitrate, device);
 
         RefreshOutputInfo();
         SequenceHeader = ReadSequenceHeader();
@@ -87,11 +98,50 @@ public sealed class H264Encoder : IDisposable
         }
     }
 
-    /// <summary>Feeds one NV12 frame and returns the access units the encoder emitted for it.</summary>
+    /// <summary>Feeds one NV12 frame in system memory and returns the emitted access units.</summary>
     public List<(byte[] Data, bool Keyframe)> Encode(byte[] nv12, long timestamp100ns, long duration100ns)
     {
-        var output = new List<(byte[] Data, bool Keyframe)>();
+        using var sample = MediaFactory.MFCreateSample();
+        using var buffer = MediaFactory.MFCreateAlignedMemoryBuffer(nv12.Length, 15);
+        buffer.Lock(out var ptr, out _, out _);
+        Marshal.Copy(nv12, 0, ptr, nv12.Length);
+        buffer.CurrentLength = nv12.Length;
+        buffer.Unlock();
+        sample.AddBuffer(buffer);
+        sample.SampleTime = timestamp100ns;
+        sample.SampleDuration = duration100ns;
 
+        var output = new List<(byte[] Data, bool Keyframe)>();
+        EncodeSample(sample, output);
+        return output;
+    }
+
+    /// <summary>Feeds one NV12 texture directly (zero copies) and returns the emitted access units.</summary>
+    public List<(byte[] Data, bool Keyframe)> Encode(ID3D11Texture2D frame, long timestamp100ns, long duration100ns)
+    {
+        if (_dxgiManager is null)
+            throw new InvalidOperationException("The encoder was not set up for D3D input.");
+
+        try
+        {
+            using var sample = MediaFactory.MFCreateSample();
+            using var surface = MediaFactory.MFCreateDXGISurfaceBuffer(Texture2DIid, frame, 0, new RawBool(false));
+            sample.AddBuffer(surface);
+            sample.SampleTime = timestamp100ns;
+            sample.SampleDuration = duration100ns;
+
+            var output = new List<(byte[] Data, bool Keyframe)>();
+            EncodeSample(sample, output);
+            return output;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"surface sample feed failed: {ex.Message}", ex);
+        }
+    }
+
+    private void EncodeSample(IMFSample sample, List<(byte[] Data, bool Keyframe)> output)
+    {
         if (_pendingFrames >= MaxPendingFrames)
         {
             // Sync MFTs (Microsoft's software encoder) accept input without bound and would
@@ -103,26 +153,16 @@ public sealed class H264Encoder : IDisposable
                 Drain(output);
                 if (++_droppedFrames % 300 == 1)
                     Console.WriteLine($"[Host] encoder is behind ({_pendingFrames} frames queued); dropped {_droppedFrames} frames so far");
-                return output;
+                return;
             }
 
             DrainEvents(output);
         }
 
-        using var sample = MediaFactory.MFCreateSample();
-        using var buffer = MediaFactory.MFCreateAlignedMemoryBuffer(nv12.Length, 15);
-        buffer.Lock(out var ptr, out _, out _);
-        Marshal.Copy(nv12, 0, ptr, nv12.Length);
-        buffer.CurrentLength = nv12.Length;
-        buffer.Unlock();
-        sample.AddBuffer(buffer);
-        sample.SampleTime = timestamp100ns;
-        sample.SampleDuration = duration100ns;
-
         if (_events is not null)
         {
             FeedEventDriven(sample, output);
-            return output;
+            return;
         }
 
         while (true)
@@ -142,10 +182,13 @@ public sealed class H264Encoder : IDisposable
 
         _pendingFrames++;
         Drain(output);
-        return output;
     }
 
-    public void Dispose() => _transform.Dispose();
+    public void Dispose()
+    {
+        _dxgiManager?.Dispose();
+        _transform.Dispose();
+    }
 
     /// <summary>Waits for the encoder's NeedInput event, feeds the sample, pulls available output.</summary>
     private void FeedEventDriven(IMFSample sample, List<(byte[] Data, bool Keyframe)> output)
@@ -223,18 +266,20 @@ public sealed class H264Encoder : IDisposable
         }
     }
 
-    private static (IMFTransform Transform, IMFMediaEventGenerator? Events) CreateTransform(int width, int height, int fps, uint bitrate)
+    private static (IMFTransform Transform, IMFMediaEventGenerator? Events, IMFDXGIDeviceManager? Manager, bool Rgb32) CreateTransform(
+        int width, int height, int fps, uint bitrate, ID3D11Device? device)
     {
         // Hardware MFTs (QCOM/Intel/AMD/NVIDIA) only show up when the HARDWARE flag is
         // set, so enumerate twice: hardware first, then anything (software fallback).
-        return TryCreateTransform(width, height, fps, bitrate,
+        return TryCreateTransform(width, height, fps, bitrate, device,
                    (uint)(EnumFlag.EnumFlagHardware | EnumFlag.EnumFlagSortandfilter), "hardware")
-               ?? TryCreateTransform(width, height, fps, bitrate,
+               ?? TryCreateTransform(width, height, fps, bitrate, device,
                    (uint)EnumFlag.EnumFlagSortandfilter, "any")
                ?? throw new InvalidOperationException("No H.264 encoder MFT found on this system.");
     }
 
-    private static (IMFTransform, IMFMediaEventGenerator?)? TryCreateTransform(int width, int height, int fps, uint bitrate, uint flags, string label)
+    private static (IMFTransform, IMFMediaEventGenerator?, IMFDXGIDeviceManager?, bool)? TryCreateTransform(
+        int width, int height, int fps, uint bitrate, ID3D11Device? device, uint flags, string label)
     {
         using var activates = MediaFactory.MFTEnumEx(
             TransformCategoryGuids.VideoEncoder,
@@ -252,9 +297,9 @@ public sealed class H264Encoder : IDisposable
                 var transform = act.ActivateObject<IMFTransform>();
                 try
                 {
-                    var events = Configure(transform, width, height, fps, bitrate);
+                    var (events, manager, rgb32) = Configure(transform, width, height, fps, bitrate, device);
                     Console.WriteLine($"[Host] using encoder: {name}");
-                    return (transform, events);
+                    return (transform, events, manager, rgb32);
                 }
                 catch
                 {
@@ -271,8 +316,9 @@ public sealed class H264Encoder : IDisposable
         return null;
     }
 
-    /// <summary>Unlocks async MFTs, negotiates types, starts streaming (ffmpeg's order).</summary>
-    private static IMFMediaEventGenerator? Configure(IMFTransform transform, int width, int height, int fps, uint bitrate)
+    /// <summary>Unlocks async MFTs, negotiates types, sets the D3D manager, starts streaming (ffmpeg's order).</summary>
+    private static (IMFMediaEventGenerator? Events, IMFDXGIDeviceManager? Manager, bool Rgb32) Configure(
+        IMFTransform transform, int width, int height, int fps, uint bitrate, ID3D11Device? device)
     {
         // MF_TRANSFORM_ASYNC marks async MFTs; it is absent on sync ones.
         var isAsync = false;
@@ -299,11 +345,55 @@ public sealed class H264Encoder : IDisposable
         CodecApi.TrySet(transform, CodecApi.GopSize, 15u, "GOP size = 15");
 
         transform.SetOutputType(0, VideoType(VideoFormatGuids.H264, width, height, fps, bitrate), 0);
-        transform.SetInputType(0, VideoType(VideoFormatGuids.NV12, width, height, fps), 0);
+
+        // See what input formats the encoder takes: RGB32 means BGRA textures can be fed
+        // as-is and the whole NV12 conversion step disappears (hardware MFTs only; the
+        // sync software encoder stays on NV12 so the CPU path stays valid).
+        Guid inputSubtype = VideoFormatGuids.NV12;
+        IMFMediaType? rgbInput = null;
+        for (var i = 0; ; i++)
+        {
+            IMFMediaType offered;
+            try { offered = transform.GetInputAvailableType(0, i); }
+            catch { break; }
+
+            var subtype = offered.GetGUID(MediaTypeAttributeKeys.Subtype);
+            Console.WriteLine($"[Host] encoder input type offered: {subtype}");
+            if (isAsync && (subtype == VideoFormatGuids.Rgb32 || subtype == VideoFormatGuids.Argb32))
+                rgbInput ??= offered;
+        }
+
+        if (rgbInput is not null)
+        {
+            inputSubtype = rgbInput.GetGUID(MediaTypeAttributeKeys.Subtype);
+            Console.WriteLine("[Host] encoder takes RGB32 input; feeding BGRA frames without color conversion.");
+        }
+
+        transform.SetInputType(0, VideoType(inputSubtype, width, height, fps), 0);
+
+        // The D3D device manager goes in after type negotiation but before streaming
+        // starts (ffmpeg's order). If the MFT rejects it, the CPU frame path still works.
+        IMFDXGIDeviceManager? manager = null;
+        if (device is not null)
+        {
+            try
+            {
+                manager = MediaFactory.MFCreateDXGIDeviceManager();
+                manager.ResetDevice(device);
+                transform.ProcessMessage(TMessageType.MessageSetD3DManager, new UIntPtr((ulong)manager.NativePointer.ToInt64()));
+                Console.WriteLine("[Host] encoder accepts D3D11 input; using the GPU frame path.");
+            }
+            catch (Exception ex)
+            {
+                manager?.Dispose();
+                manager = null;
+                Console.WriteLine($"[Host] D3D device manager rejected ({ex.Message}); using the CPU frame path.");
+            }
+        }
 
         transform.ProcessMessage(TMessageType.MessageNotifyBeginStreaming, UIntPtr.Zero);
         transform.ProcessMessage(TMessageType.MessageNotifyStartOfStream, UIntPtr.Zero);
-        return events;
+        return (events, manager, inputSubtype != VideoFormatGuids.NV12);
     }
 
     /// <summary>Reads SPS/PPS from the output type, polling briefly (Qualcomm's encoder

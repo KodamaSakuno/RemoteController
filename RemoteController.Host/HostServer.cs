@@ -59,10 +59,8 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
                 await stream.WriteAsync(new ServerHelloMessage(ProtocolInfo.Version, screenWidth, screenHeight));
                 Console.WriteLine($"[Host] Streaming {screenWidth}x{screenHeight} to {endpoint}");
 
-                using var encoder = new H264Encoder(screenWidth, screenHeight, fps, bitrate);
-                Console.WriteLine($"[Host] encoder ready (+{Clock.ElapsedMilliseconds} ms)");
                 using var sessionCts = new CancellationTokenSource();
-                var sendTask = StreamLoopAsync(stream, capture, encoder, sessionCts.Token);
+                var sendTask = StreamLoopAsync(stream, capture, screenWidth, screenHeight, sessionCts.Token);
                 var receiveTask = ReceiveLoopAsync(stream, screenWidth, screenHeight, sessionCts.Token);
 
                 await Task.WhenAny(sendTask, receiveTask);
@@ -94,7 +92,7 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
     }
 
     /// <summary>Captures, encodes and pushes frames. Runs sequentially so a slow client never queues up stale frames.</summary>
-    private async Task StreamLoopAsync(MessageStream stream, DxgiScreenCapture capture, H264Encoder encoder, CancellationToken cancellationToken)
+    private async Task StreamLoopAsync(MessageStream stream, DxgiScreenCapture capture, int screenWidth, int screenHeight, CancellationToken cancellationToken)
     {
         // Yield before doing anything else: on a quiet desktop every loop iteration can
         // complete synchronously (null frames from the acquire timeout, inline socket
@@ -103,49 +101,103 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
         // ReceiveLoopAsync from ever being started.
         await Task.Yield();
 
-        var headerSent = false;
-        long captured = 0, sent = 0;
-        while (!cancellationToken.IsCancellationRequested)
+        var useGpu = true;
+        var encoder = NewEncoder(useGpu);
+
+        H264Encoder NewEncoder(bool gpu)
         {
-            var started = Environment.TickCount64;
+            var created = gpu
+                ? new H264Encoder(screenWidth, screenHeight, fps, bitrate, capture.Device)
+                : new H264Encoder(screenWidth, screenHeight, fps, bitrate);
+            Console.WriteLine($"[Host] encoder ready (+{Clock.ElapsedMilliseconds} ms)");
+            return created;
+        }
 
-            // Null means the desktop did not change (AcquireNextFrame already blocked ~100ms),
-            // so an idle desktop sends nothing at all.
-            if (capture.CaptureNv12() is { } nv12)
+        try
+        {
+            var headerSent = false;
+            long captured = 0, sent = 0;
+            while (!cancellationToken.IsCancellationRequested)
             {
-                if (captured == 0)
-                    Console.WriteLine($"[Host] first frame captured (+{Clock.ElapsedMilliseconds} ms)");
-                captured++;
+                var started = Environment.TickCount64;
+
+                // Null means the desktop did not change (AcquireNextFrame already blocked ~100ms),
+                // so an idle desktop sends nothing at all. The GPU path hands textures straight
+                // to a hardware encoder; the CPU path feeds system memory to the software one.
+                List<(byte[] Data, bool Keyframe)>? outputs = null;
                 var timestamp = DateTime.UtcNow.Ticks; // 100 ns units, wall clock for client-side lag measurement
-                foreach (var (data, keyframe) in encoder.Encode(nv12, timestamp, 333_333))
+                if (useGpu)
                 {
-                    if (sent == 0)
-                        Console.WriteLine($"[Host] first sample encoded (+{Clock.ElapsedMilliseconds} ms)");
-
-                    // A decoder must start on a keyframe preceded by SPS/PPS; the encoder's
-                    // first output is always a keyframe, so attach the sequence header to it.
-                    if (!headerSent && !keyframe)
-                        continue;
-                    var payload = data;
-                    if (!headerSent)
+                    try
                     {
-                        payload = new byte[encoder.SequenceHeader.Length + data.Length];
-                        encoder.SequenceHeader.CopyTo(payload, 0);
-                        data.CopyTo(payload, encoder.SequenceHeader.Length);
-                        headerSent = true;
+                        if (encoder.InputIsRgb32)
+                        {
+                            // RGB32 input: feed BGRA frames as-is, no color conversion at all.
+                            if (capture.CaptureBgra() is { } bgraFrame)
+                                outputs = encoder.Encode(bgraFrame, timestamp, 333_333);
+                        }
+                        else if (capture.CaptureFrame() is { } frame)
+                        {
+                            outputs = encoder.Encode(frame, timestamp, 333_333);
+                        }
                     }
-
-                    await stream.WriteAsync(new VideoFrameMessage(timestamp, keyframe, payload), cancellationToken);
-                    if (sent == 0)
-                        Console.WriteLine($"[Host] first frame sent (+{Clock.ElapsedMilliseconds} ms)");
-                    sent++;
+                    catch (Exception ex)
+                    {
+                        // Recreate the encoder without a D3D manager instead of just
+                        // flipping a flag: once a manager is set, the MFT will not accept
+                        // system-memory input anymore (native crash).
+                        Console.WriteLine($"[Host] GPU frame path failed ({ex.Message}); switching to the CPU frame path.");
+                        encoder.Dispose();
+                        useGpu = false;
+                        encoder = NewEncoder(false);
+                    }
                 }
 
-                var elapsed = (int)(Environment.TickCount64 - started);
-                var delay = _frameIntervalMs - elapsed;
-                if (delay > 0)
-                    await Task.Delay(delay, cancellationToken);
+                if (outputs is null && !useGpu)
+                {
+                    if (capture.CaptureNv12() is { } nv12)
+                        outputs = encoder.Encode(nv12, timestamp, 333_333);
+                }
+
+                if (outputs is not null)
+                {
+                    if (captured == 0)
+                        Console.WriteLine($"[Host] first frame captured (+{Clock.ElapsedMilliseconds} ms)");
+                    captured++;
+                    foreach (var (data, keyframe) in outputs)
+                    {
+                        if (sent == 0)
+                            Console.WriteLine($"[Host] first sample encoded (+{Clock.ElapsedMilliseconds} ms)");
+
+                        // A decoder must start on a keyframe preceded by SPS/PPS; the encoder's
+                        // first output is always a keyframe, so attach the sequence header to it.
+                        if (!headerSent && !keyframe)
+                            continue;
+                        var payload = data;
+                        if (!headerSent)
+                        {
+                            payload = new byte[encoder.SequenceHeader.Length + data.Length];
+                            encoder.SequenceHeader.CopyTo(payload, 0);
+                            data.CopyTo(payload, encoder.SequenceHeader.Length);
+                            headerSent = true;
+                        }
+
+                        await stream.WriteAsync(new VideoFrameMessage(timestamp, keyframe, payload), cancellationToken);
+                        if (sent == 0)
+                            Console.WriteLine($"[Host] first frame sent (+{Clock.ElapsedMilliseconds} ms)");
+                        sent++;
+                    }
+
+                    var elapsed = (int)(Environment.TickCount64 - started);
+                    var delay = _frameIntervalMs - elapsed;
+                    if (delay > 0)
+                        await Task.Delay(delay, cancellationToken);
+                }
             }
+        }
+        finally
+        {
+            encoder.Dispose();
         }
     }
 

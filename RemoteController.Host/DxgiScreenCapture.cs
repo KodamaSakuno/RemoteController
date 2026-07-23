@@ -7,20 +7,24 @@ using Vortice.DXGI;
 namespace RemoteController.Host;
 
 /// <summary>
-/// Captures the primary display via DXGI Desktop Duplication and returns frames as NV12
-/// (the pixel format H.264 encoder MFTs consume). Acquired frames arrive in the panel's
-/// native scanout orientation; when the display runs in a rotated mode (e.g. a portrait
-/// panel set to landscape) they are rotated back to the desktop orientation on the GPU
-/// (a fullscreen quad with rotated UVs) before readback. <see cref="CaptureNv12"/> returns
-/// null when the desktop has not changed, so an idle desktop costs neither bandwidth nor
-/// encode CPU. Windows 8+ only.
+/// Captures the primary display via DXGI Desktop Duplication. Acquired frames arrive in
+/// the panel's native scanout orientation; when the display runs in a rotated mode (e.g.
+/// a portrait panel set to landscape) they are rotated back to the desktop orientation on
+/// the GPU. Two output paths:
+/// <see cref="CaptureFrame"/> renders the frame into an NV12 texture entirely on the GPU
+/// (for hardware encoder MFTs fed via DXGI surfaces); <see cref="CaptureNv12"/> reads back
+/// and converts on the CPU (for the software encoder MFT, which takes system memory).
+/// Both return null when the desktop has not changed, so an idle desktop costs neither
+/// bandwidth nor encode CPU. Windows 8+ only.
 /// </summary>
 public sealed class DxgiScreenCapture : IDisposable
 {
     private const uint AcquireTimeoutMs = 100;
+    private const int Nv12PoolSize = 4;
 
-    // Textured fullscreen quad used to rotate a frame on the GPU.
-    private const string RotationShaderSource = """
+    // Textured fullscreen quad: identity UV mapping (also used by the rotation pass with
+    // permuted UVs baked into the vertex buffer).
+    private const string QuadShaderSource = """
         struct VsInput
         {
             float3 pos : POSITION;
@@ -48,6 +52,23 @@ public sealed class DxgiScreenCapture : IDisposable
         {
             return frame.Sample(frameSampler, input.uv);
         }
+
+        // BT.601 studio-swing luma, matching the CPU conversion.
+        float4 PSLuma(VsOutput input) : SV_TARGET
+        {
+            float3 c = frame.Sample(frameSampler, input.uv).rgb;
+            float y = 0.0627 + 0.2578 * c.r + 0.5039 * c.g + 0.0977 * c.b;
+            return float4(y, 0.0, 0.0, 1.0);
+        }
+
+        // BT.601 studio-swing chroma at half resolution (bilinear tap ~= 2x2 average).
+        float4 PSChroma(VsOutput input) : SV_TARGET
+        {
+            float3 c = frame.Sample(frameSampler, input.uv).rgb;
+            float u = 0.502 - 0.1484 * c.r - 0.2891 * c.g + 0.4375 * c.b;
+            float v = 0.502 + 0.4375 * c.r - 0.3672 * c.g - 0.0703 * c.b;
+            return float4(u, v, 0.0, 1.0);
+        }
         """;
 
     private readonly ID3D11Device _device;
@@ -58,15 +79,38 @@ public sealed class DxgiScreenCapture : IDisposable
     private ID3D11Texture2D? _staging;
     private byte[]? _nv12;
 
+    // NV12 textures handed to the encoder; pooled because the MFT may still reference a
+    // surface while we render the next frame into another one. The Y/UV planes are
+    // rendered into plain R8/R8G8 textures (universally renderable) and then copied into
+    // the NV12 texture's planes — Adreno rejects NV12 as a draw-time render target.
+    private readonly ID3D11Texture2D?[] _nv12Pool = new ID3D11Texture2D?[Nv12PoolSize];
+    private readonly ID3D11Texture2D?[] _yPlanePool = new ID3D11Texture2D?[Nv12PoolSize];
+    private readonly ID3D11Texture2D?[] _uvPlanePool = new ID3D11Texture2D?[Nv12PoolSize];
+    private readonly ID3D11RenderTargetView?[] _yRtvs = new ID3D11RenderTargetView?[Nv12PoolSize];
+    private readonly ID3D11RenderTargetView?[] _uvRtvs = new ID3D11RenderTargetView?[Nv12PoolSize];
+    private int _nv12Index;
+
+    // Pooled BGRA frame textures for encoders that accept RGB32 input directly.
+    private readonly ID3D11Texture2D?[] _bgraPool = new ID3D11Texture2D?[Nv12PoolSize];
+    private readonly ID3D11RenderTargetView?[] _bgraRtvs = new ID3D11RenderTargetView?[Nv12PoolSize];
+    private int _bgraIndex;
+    private int _bgraPoolWidth;
+    private int _bgraPoolHeight;
+
     // GPU rotation pipeline, created lazily and only used when the display is rotated.
     private ID3D11Texture2D? _rotated;
     private ID3D11RenderTargetView? _rotatedRtv;
-    private ID3D11VertexShader? _vertexShader;
+
+    // Shared fullscreen-quad pipeline (rotation and NV12 conversion alike).
+    private ID3D11VertexShader? _quadVertexShader;
     private ID3D11PixelShader? _pixelShader;
+    private ID3D11PixelShader? _lumaShader;
+    private ID3D11PixelShader? _chromaShader;
     private ID3D11InputLayout? _inputLayout;
     private ID3D11SamplerState? _sampler;
     private ID3D11RasterizerState? _rasterizerState;
     private ID3D11Buffer? _quadVertices;
+    private ID3D11Buffer? _identityQuadVertices;
     private ModeRotation _quadRotation = ModeRotation.Unspecified;
 
     private ModeRotation _rotation;
@@ -76,6 +120,9 @@ public sealed class DxgiScreenCapture : IDisposable
 
     /// <summary>Stale frames discarded by the acquisition catch-up (diagnostics).</summary>
     public int CatchUpDiscards => _catchUpDiscards;
+
+    /// <summary>The D3D device all frames and NV12 textures live on.</summary>
+    public ID3D11Device Device => _device;
 
     public DxgiScreenCapture()
     {
@@ -103,11 +150,61 @@ public sealed class DxgiScreenCapture : IDisposable
     private static extern bool SetProcessDPIAware();
 
     /// <summary>
-    /// Captures the next desktop update and converts it to NV12 in the desktop orientation,
+    /// Captures the next desktop update and converts it to NV12 on the CPU (system memory),
     /// or returns null when no update arrived within the acquire timeout. The returned
     /// buffer is reused on the next call.
     /// </summary>
-    public byte[]? CaptureNv12()
+    public byte[]? CaptureNv12() => WithFrame(texture =>
+    {
+        var source = texture;
+        if (_rotation is not (ModeRotation.Identity or ModeRotation.Unspecified))
+        {
+            // The staging texture is desktop-oriented, so rotate on the GPU first.
+            RotateFrame(texture, _rotated!, _rotatedRtv!);
+            source = _rotated!;
+        }
+
+        _context.CopyResource(_staging!, source);
+        return ReadbackNv12();
+    });
+
+    /// <summary>
+    /// Captures the next desktop update as a plain BGRA texture (rotation applied), pooled
+    /// for the encoder to hold. Returns null when no update arrived within the timeout.
+    /// </summary>
+    public ID3D11Texture2D? CaptureBgra() => WithFrame(texture =>
+    {
+        EnsureBgraPool();
+        var slot = _bgraIndex;
+        _bgraIndex = (_bgraIndex + 1) % Nv12PoolSize;
+
+        if (_rotation is not (ModeRotation.Identity or ModeRotation.Unspecified))
+            RotateFrame(texture, _bgraPool[slot]!, _bgraRtvs[slot]!);
+        else
+            _context.CopyResource(_bgraPool[slot]!, texture);
+
+        return _bgraPool[slot]!;
+    });
+
+    /// <summary>
+    /// Captures the next desktop update and renders it into a pooled NV12 texture entirely
+    /// on the GPU (rotation and BT.601 conversion included), or returns null when no update
+    /// arrived within the acquire timeout.
+    /// </summary>
+    public ID3D11Texture2D? CaptureFrame() => WithFrame(texture =>
+    {
+        var source = texture;
+        if (_rotation is not (ModeRotation.Identity or ModeRotation.Unspecified))
+        {
+            RotateFrame(texture, _rotated!, _rotatedRtv!);
+            source = _rotated!;
+        }
+
+        return ConvertToNv12(source);
+    });
+
+    /// <summary>Runs the shared acquire/rotate prologue and hands the newest frame to <paramref name="produce"/>.</summary>
+    private T? WithFrame<T>(Func<ID3D11Texture2D, T?> produce) where T : class
     {
         if (_duplication is null)
             RecreateDuplication();
@@ -166,18 +263,7 @@ public sealed class DxgiScreenCapture : IDisposable
         {
             using var texture = resource!.QueryInterface<ID3D11Texture2D>();
             EnsureBuffers((int)texture.Description.Width, (int)texture.Description.Height);
-            if (_rotation is ModeRotation.Identity or ModeRotation.Unspecified)
-            {
-                _context.CopyResource(_staging!, texture);
-            }
-            else
-            {
-                // The staging texture is desktop-oriented, so rotate on the GPU first.
-                RotateFrame(texture);
-                _context.CopyResource(_staging!, _rotated!);
-            }
-
-            return ReadbackNv12();
+            return produce(texture);
         }
         finally
         {
@@ -190,14 +276,28 @@ public sealed class DxgiScreenCapture : IDisposable
     {
         _duplication?.Dispose();
         _staging?.Dispose();
+        for (var i = 0; i < Nv12PoolSize; i++)
+        {
+            _yRtvs[i]?.Dispose();
+            _uvRtvs[i]?.Dispose();
+            _yPlanePool[i]?.Dispose();
+            _uvPlanePool[i]?.Dispose();
+            _nv12Pool[i]?.Dispose();
+            _bgraRtvs[i]?.Dispose();
+            _bgraPool[i]?.Dispose();
+        }
+
         _rotatedRtv?.Dispose();
         _rotated?.Dispose();
         _quadVertices?.Dispose();
+        _identityQuadVertices?.Dispose();
         _sampler?.Dispose();
         _rasterizerState?.Dispose();
         _inputLayout?.Dispose();
-        _vertexShader?.Dispose();
+        _lumaShader?.Dispose();
+        _chromaShader?.Dispose();
         _pixelShader?.Dispose();
+        _quadVertexShader?.Dispose();
         _output.Dispose();
         _context.Dispose();
         _device.Dispose();
@@ -261,6 +361,14 @@ public sealed class DxgiScreenCapture : IDisposable
         _rotated?.Dispose();
         _rotatedRtv = null;
         _rotated = null;
+        for (var i = 0; i < Nv12PoolSize; i++)
+        {
+            _yRtvs[i]?.Dispose();
+            _uvRtvs[i]?.Dispose();
+            _yPlanePool[i]?.Dispose();
+            _uvPlanePool[i]?.Dispose();
+            _nv12Pool[i]?.Dispose();
+        }
 
         _rawWidth = rawWidth;
         _rawHeight = rawHeight;
@@ -286,6 +394,60 @@ public sealed class DxgiScreenCapture : IDisposable
         });
         _nv12 = new byte[Width * Height * 3 / 2];
 
+        for (var i = 0; i < Nv12PoolSize; i++)
+        {
+            try
+            {
+                // NV12 texture: copy destination and encoder input only, never a render
+                // target (Adreno rejects NV12 at draw time). SHARED matches what OBS
+                // hands to encoder MFTs — hardware encoders may open the surface from
+                // their own internal device and require it to be shareable.
+                _nv12Pool[i] = _device.CreateTexture2D(new Texture2DDescription
+                {
+                    Width = (uint)Width,
+                    Height = (uint)Height,
+                    MipLevels = 1,
+                    ArraySize = 1,
+                    Format = Format.NV12,
+                    SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Default,
+                    BindFlags = BindFlags.RenderTarget,
+                    CPUAccessFlags = CpuAccessFlags.None,
+                    MiscFlags = ResourceOptionFlags.SharedKeyedMutex,
+                });
+                _yPlanePool[i] = _device.CreateTexture2D(new Texture2DDescription
+                {
+                    Width = (uint)Width,
+                    Height = (uint)Height,
+                    MipLevels = 1,
+                    ArraySize = 1,
+                    Format = Format.R8_UNorm,
+                    SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Default,
+                    BindFlags = BindFlags.RenderTarget,
+                    CPUAccessFlags = CpuAccessFlags.None,
+                });
+                _uvPlanePool[i] = _device.CreateTexture2D(new Texture2DDescription
+                {
+                    Width = (uint)(Width / 2),
+                    Height = (uint)(Height / 2),
+                    MipLevels = 1,
+                    ArraySize = 1,
+                    Format = Format.R8G8_UNorm,
+                    SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Default,
+                    BindFlags = BindFlags.RenderTarget,
+                    CPUAccessFlags = CpuAccessFlags.None,
+                });
+                _yRtvs[i] = _device.CreateRenderTargetView(_yPlanePool[i]);
+                _uvRtvs[i] = _device.CreateRenderTargetView(_uvPlanePool[i]);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"NV12 pool/RTV creation failed: {ex.Message}", ex);
+            }
+        }
+
         if (needsRotation)
         {
             _rotated = _device.CreateTexture2D(new Texture2DDescription
@@ -297,71 +459,160 @@ public sealed class DxgiScreenCapture : IDisposable
                 Format = Format.B8G8R8A8_UNorm,
                 SampleDescription = new SampleDescription(1, 0),
                 Usage = ResourceUsage.Default,
-                BindFlags = BindFlags.RenderTarget,
+                BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
                 CPUAccessFlags = CpuAccessFlags.None,
             });
             _rotatedRtv = _device.CreateRenderTargetView(_rotated);
         }
     }
 
-    /// <summary>Draws the scanout-oriented frame into the desktop-oriented render target.</summary>
-    private void RotateFrame(ID3D11Texture2D source)
+    /// <summary>Draws the scanout-oriented frame into the given desktop-oriented render target.</summary>
+    private void RotateFrame(ID3D11Texture2D source, ID3D11Texture2D target, ID3D11RenderTargetView targetRtv)
     {
-        EnsureRenderResources();
-
-        using var view = _device.CreateShaderResourceView(source);
-        _context.IASetInputLayout(_inputLayout);
-        _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-        _context.IASetVertexBuffer(0, _quadVertices!, 5 * sizeof(float), 0);
-        _context.VSSetShader(_vertexShader!);
-        _context.RSSetState(_rasterizerState);
-        _context.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, Width, Height));
-        _context.PSSetShader(_pixelShader!);
-        _context.PSSetSampler(0, _sampler!);
-        _context.PSSetShaderResource(0, view);
-        _context.OMSetRenderTargets(_rotatedRtv!);
-        _context.Draw(6, 0);
-    }
-
-    private void EnsureRenderResources()
-    {
-        if (_vertexShader is null)
-        {
-            var shaderBytes = System.Text.Encoding.ASCII.GetBytes(RotationShaderSource);
-            var vsResult = Compiler.Compile(shaderBytes, "VSMain", "RotationShader", "vs_4_0",
-                out var vsBlob, out var vsErrors);
-            if (vsResult.Failure)
-                throw new InvalidOperationException($"Vertex shader compile failed: {vsErrors?.AsString()}");
-            var psResult = Compiler.Compile(shaderBytes, "PSMain", "RotationShader", "ps_4_0",
-                out var psBlob, out var psErrors);
-            if (psResult.Failure)
-                throw new InvalidOperationException($"Pixel shader compile failed: {psErrors?.AsString()}");
-
-            _vertexShader = _device.CreateVertexShader(vsBlob!.AsSpan());
-            _pixelShader = _device.CreatePixelShader(psBlob!.AsSpan());
-            _inputLayout = _device.CreateInputLayout(new[]
-            {
-                new InputElementDescription("POSITION", 0, Format.R32G32B32_Float, 0, 0, InputClassification.PerVertexData, 0),
-                new InputElementDescription("TEXCOORD", 0, Format.R32G32_Float, 12, 0, InputClassification.PerVertexData, 0),
-            }, vsBlob.AsSpan());
-            _sampler = _device.CreateSamplerState(new SamplerDescription
-            {
-                Filter = Filter.MinMagMipLinear,
-                AddressU = TextureAddressMode.Clamp,
-                AddressV = TextureAddressMode.Clamp,
-                AddressW = TextureAddressMode.Clamp,
-                MipLODBias = 0,
-                MaxAnisotropy = 1,
-                ComparisonFunc = ComparisonFunction.Never,
-                BorderColor = new Vortice.Mathematics.Color4(0, 0, 0, 0),
-                MinLOD = 0,
-                MaxLOD = float.MaxValue,
-            });
-            _rasterizerState = _device.CreateRasterizerState(new RasterizerDescription(CullMode.None, FillMode.Solid));
-        }
+        EnsureQuadResources();
 
         if (_quadVertices is null || _quadRotation != _rotation)
             RebuildQuadVertices();
+
+        using var view = _device.CreateShaderResourceView(source);
+        BeginQuad(view);
+        _context.PSSetShader(_pixelShader!);
+        _context.OMSetRenderTargets(targetRtv);
+        _context.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, Width, Height));
+        _context.Draw(6, 0);
+    }
+
+    /// <summary>Renders the frame into the next pooled NV12 texture (identity UVs).</summary>
+    private ID3D11Texture2D ConvertToNv12(ID3D11Texture2D source)
+    {
+        EnsureQuadResources();
+        if (_identityQuadVertices is null)
+            _identityQuadVertices = CreateQuadVertices(
+                (0f, 0f), (1f, 0f), (0f, 1f), (1f, 1f)); // TL, TR, BL, BR
+
+        var stage = "source view";
+        try
+        {
+            var index = _nv12Index;
+            _nv12Index = (_nv12Index + 1) % Nv12PoolSize;
+
+            using var view = _device.CreateShaderResourceView(source);
+            stage = "quad state";
+            BeginQuad(view, _identityQuadVertices!);
+
+            // Render into plain R8/R8G8 plane textures (universally renderable), then
+            // copy the planes into the NV12 texture — Adreno rejects NV12 at draw time.
+            stage = "luma draw";
+            _context.PSSetShader(_lumaShader!);
+            _context.OMSetRenderTargets(_yRtvs[index]!);
+            _context.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, Width, Height));
+            _context.Draw(6, 0);
+
+            stage = "chroma draw";
+            _context.PSSetShader(_chromaShader!);
+            _context.OMSetRenderTargets(_uvRtvs[index]!);
+            _context.RSSetViewport(new Vortice.Mathematics.Viewport(0, 0, Width / 2, Height / 2));
+            _context.Draw(6, 0);
+
+            stage = "plane copy";
+            _context.CopySubresourceRegion(_nv12Pool[index]!, 0, 0, 0, 0, _yPlanePool[index]!, 0, null);
+            _context.CopySubresourceRegion(_nv12Pool[index]!, 1, 0, 0, 0, _uvPlanePool[index]!, 0, null);
+
+            return _nv12Pool[index]!;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"NV12 conversion ({stage}) failed: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>Creates (or recreates) the pooled BGRA frame textures when dimensions change.</summary>
+    private void EnsureBgraPool()
+    {
+        if (_bgraPool[0] is not null && _bgraPoolWidth == Width && _bgraPoolHeight == Height)
+            return;
+
+        for (var i = 0; i < Nv12PoolSize; i++)
+        {
+            _bgraRtvs[i]?.Dispose();
+            _bgraPool[i]?.Dispose();
+            _bgraPool[i] = _device.CreateTexture2D(new Texture2DDescription
+            {
+                Width = (uint)Width,
+                Height = (uint)Height,
+                MipLevels = 1,
+                ArraySize = 1,
+                Format = Format.B8G8R8A8_UNorm,
+                SampleDescription = new SampleDescription(1, 0),
+                Usage = ResourceUsage.Default,
+                BindFlags = BindFlags.RenderTarget,
+                CPUAccessFlags = CpuAccessFlags.None,
+            });
+            _bgraRtvs[i] = _device.CreateRenderTargetView(_bgraPool[i]);
+        }
+
+        _bgraPoolWidth = Width;
+        _bgraPoolHeight = Height;
+    }
+
+    /// <summary>Sets up the shared quad pipeline state for a draw from <paramref name="source"/>.</summary>
+    private void BeginQuad(ID3D11ShaderResourceView source, ID3D11Buffer? vertices = null)
+    {
+        _context.IASetInputLayout(_inputLayout);
+        _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+        _context.IASetVertexBuffer(0, vertices ?? _quadVertices!, 5 * sizeof(float), 0);
+        _context.VSSetShader(_quadVertexShader!);
+        _context.RSSetState(_rasterizerState);
+        _context.PSSetSampler(0, _sampler!);
+        _context.PSSetShaderResource(0, source);
+    }
+
+    private void EnsureQuadResources()
+    {
+        if (_quadVertexShader is not null)
+            return;
+
+        var shaderBytes = System.Text.Encoding.ASCII.GetBytes(QuadShaderSource);
+        var vsResult = Compiler.Compile(shaderBytes, "VSMain", "QuadShader", "vs_4_0",
+            out var vsBlob, out var vsErrors);
+        if (vsResult.Failure)
+            throw new InvalidOperationException($"Vertex shader compile failed: {vsErrors?.AsString()}");
+        var psResult = Compiler.Compile(shaderBytes, "PSMain", "QuadShader", "ps_4_0",
+            out var psBlob, out var psErrors);
+        if (psResult.Failure)
+            throw new InvalidOperationException($"Pixel shader compile failed: {psErrors?.AsString()}");
+        var lumaResult = Compiler.Compile(shaderBytes, "PSLuma", "QuadShader", "ps_4_0",
+            out var lumaBlob, out var lumaErrors);
+        if (lumaResult.Failure)
+            throw new InvalidOperationException($"Luma shader compile failed: {lumaErrors?.AsString()}");
+        var chromaResult = Compiler.Compile(shaderBytes, "PSChroma", "QuadShader", "ps_4_0",
+            out var chromaBlob, out var chromaErrors);
+        if (chromaResult.Failure)
+            throw new InvalidOperationException($"Chroma shader compile failed: {chromaErrors?.AsString()}");
+
+        _quadVertexShader = _device.CreateVertexShader(vsBlob!.AsSpan());
+        _pixelShader = _device.CreatePixelShader(psBlob!.AsSpan());
+        _lumaShader = _device.CreatePixelShader(lumaBlob!.AsSpan());
+        _chromaShader = _device.CreatePixelShader(chromaBlob!.AsSpan());
+        _inputLayout = _device.CreateInputLayout(new[]
+        {
+            new InputElementDescription("POSITION", 0, Format.R32G32B32_Float, 0, 0, InputClassification.PerVertexData, 0),
+            new InputElementDescription("TEXCOORD", 0, Format.R32G32_Float, 12, 0, InputClassification.PerVertexData, 0),
+        }, vsBlob.AsSpan());
+        _sampler = _device.CreateSamplerState(new SamplerDescription
+        {
+            Filter = Filter.MinMagMipLinear,
+            AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp,
+            MipLODBias = 0,
+            MaxAnisotropy = 1,
+            ComparisonFunc = ComparisonFunction.Never,
+            BorderColor = new Vortice.Mathematics.Color4(0, 0, 0, 0),
+            MinLOD = 0,
+            MaxLOD = float.MaxValue,
+        });
+        _rasterizerState = _device.CreateRasterizerState(new RasterizerDescription(CullMode.None, FillMode.Solid));
     }
 
     /// <summary>
@@ -383,24 +634,30 @@ public sealed class DxgiScreenCapture : IDisposable
             _ => ((1f, 0f), (1f, 1f), (0f, 0f), (0f, 1f)),
         };
 
+        _quadVertices?.Dispose();
+        _quadVertices = CreateQuadVertices(tl, tr, bl, br);
+        _quadRotation = _rotation;
+    }
+
+    private ID3D11Buffer CreateQuadVertices((float U, float V) tl, (float U, float V) tr, (float U, float V) bl, (float U, float V) br)
+    {
         // Two triangles covering the full quad: (BL, TL, TR) and (TR, BL, BR).
         float[] vertices =
         {
             // x, y, z, u, v
-            -1, -1, 0, bl.Item1, bl.Item2,
-            -1,  1, 0, tl.Item1, tl.Item2,
-             1,  1, 0, tr.Item1, tr.Item2,
-             1,  1, 0, tr.Item1, tr.Item2,
-            -1, -1, 0, bl.Item1, bl.Item2,
-             1, -1, 0, br.Item1, br.Item2,
+            -1, -1, 0, bl.U, bl.V,
+            -1,  1, 0, tl.U, tl.V,
+             1,  1, 0, tr.U, tr.V,
+             1,  1, 0, tr.U, tr.V,
+            -1, -1, 0, bl.U, bl.V,
+             1, -1, 0, br.U, br.V,
         };
 
-        _quadVertices?.Dispose();
         unsafe
         {
             fixed (float* p = vertices)
             {
-                _quadVertices = _device.CreateBuffer(
+                return _device.CreateBuffer(
                     new BufferDescription
                     {
                         ByteWidth = (uint)(vertices.Length * sizeof(float)),
@@ -411,8 +668,6 @@ public sealed class DxgiScreenCapture : IDisposable
                     new SubresourceData((IntPtr)p));
             }
         }
-
-        _quadRotation = _rotation;
     }
 
     /// <summary>Copies the staging texture out and converts BGRA to NV12 (BT.601 studio swing).</summary>
