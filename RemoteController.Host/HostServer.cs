@@ -1,12 +1,16 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using RemoteController.Shared.Protocol;
 
 namespace RemoteController.Host;
 
-public sealed class HostServer(int port)
+public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
 {
-    private const int FrameIntervalMs = 33; // ~30 FPS cap
+    private readonly int _frameIntervalMs = 1000 / fps;
+
+    // Full-resolution clock for log timestamps (TickCount64 quantizes to ~15.6 ms).
+    private static readonly Stopwatch Clock = Stopwatch.StartNew();
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
@@ -33,7 +37,7 @@ public sealed class HostServer(int port)
         }
     }
 
-    private static async Task HandleClientAsync(TcpClient client)
+    private async Task HandleClientAsync(TcpClient client)
     {
         var endpoint = client.Client.RemoteEndPoint;
         Console.WriteLine($"[Host] Client connected: {endpoint}");
@@ -51,11 +55,14 @@ public sealed class HostServer(int port)
                 using var capture = new DxgiScreenCapture();
                 var screenWidth = capture.Width;
                 var screenHeight = capture.Height;
+                Console.WriteLine($"[Host] capture ready (+{Clock.ElapsedMilliseconds} ms)");
                 await stream.WriteAsync(new ServerHelloMessage(ProtocolInfo.Version, screenWidth, screenHeight));
                 Console.WriteLine($"[Host] Streaming {screenWidth}x{screenHeight} to {endpoint}");
 
+                using var encoder = new H264Encoder(screenWidth, screenHeight, fps, bitrate);
+                Console.WriteLine($"[Host] encoder ready (+{Clock.ElapsedMilliseconds} ms)");
                 using var sessionCts = new CancellationTokenSource();
-                var sendTask = StreamLoopAsync(stream, capture, sessionCts.Token);
+                var sendTask = StreamLoopAsync(stream, capture, encoder, sessionCts.Token);
                 var receiveTask = ReceiveLoopAsync(stream, screenWidth, screenHeight, sessionCts.Token);
 
                 await Task.WhenAny(sendTask, receiveTask);
@@ -64,9 +71,17 @@ public sealed class HostServer(int port)
                 {
                     await Task.WhenAll(sendTask, receiveTask);
                 }
-                catch
+                catch (OperationCanceledException)
                 {
-                    // loop failures are expected during teardown; the session is over either way
+                    // expected during teardown
+                }
+                catch (IOException)
+                {
+                    // connection dropped mid-session; the disconnect log line covers it
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Host] Stream loop error ({endpoint}): {ex.Message}");
                 }
             }
         }
@@ -78,8 +93,8 @@ public sealed class HostServer(int port)
         Console.WriteLine($"[Host] Client disconnected: {endpoint}");
     }
 
-    /// <summary>Captures and pushes frames. Runs sequentially so a slow client never queues up stale frames.</summary>
-    private static async Task StreamLoopAsync(MessageStream stream, DxgiScreenCapture capture, CancellationToken cancellationToken)
+    /// <summary>Captures, encodes and pushes frames. Runs sequentially so a slow client never queues up stale frames.</summary>
+    private async Task StreamLoopAsync(MessageStream stream, DxgiScreenCapture capture, H264Encoder encoder, CancellationToken cancellationToken)
     {
         // Yield before doing anything else: on a quiet desktop every loop iteration can
         // complete synchronously (null frames from the acquire timeout, inline socket
@@ -88,25 +103,53 @@ public sealed class HostServer(int port)
         // ReceiveLoopAsync from ever being started.
         await Task.Yield();
 
+        var headerSent = false;
+        long captured = 0, sent = 0;
         while (!cancellationToken.IsCancellationRequested)
         {
             var started = Environment.TickCount64;
 
             // Null means the desktop did not change (AcquireNextFrame already blocked ~100ms),
             // so an idle desktop sends nothing at all.
-            if (capture.CaptureJpeg() is { } jpeg)
+            if (capture.CaptureNv12() is { } nv12)
             {
-                await stream.WriteAsync(new FrameMessage(capture.Width, capture.Height, jpeg), cancellationToken);
+                if (captured == 0)
+                    Console.WriteLine($"[Host] first frame captured (+{Clock.ElapsedMilliseconds} ms)");
+                captured++;
+                var timestamp = DateTime.UtcNow.Ticks; // 100 ns units, wall clock for client-side lag measurement
+                foreach (var (data, keyframe) in encoder.Encode(nv12, timestamp, 333_333))
+                {
+                    if (sent == 0)
+                        Console.WriteLine($"[Host] first sample encoded (+{Clock.ElapsedMilliseconds} ms)");
+
+                    // A decoder must start on a keyframe preceded by SPS/PPS; the encoder's
+                    // first output is always a keyframe, so attach the sequence header to it.
+                    if (!headerSent && !keyframe)
+                        continue;
+                    var payload = data;
+                    if (!headerSent)
+                    {
+                        payload = new byte[encoder.SequenceHeader.Length + data.Length];
+                        encoder.SequenceHeader.CopyTo(payload, 0);
+                        data.CopyTo(payload, encoder.SequenceHeader.Length);
+                        headerSent = true;
+                    }
+
+                    await stream.WriteAsync(new VideoFrameMessage(timestamp, keyframe, payload), cancellationToken);
+                    if (sent == 0)
+                        Console.WriteLine($"[Host] first frame sent (+{Clock.ElapsedMilliseconds} ms)");
+                    sent++;
+                }
 
                 var elapsed = (int)(Environment.TickCount64 - started);
-                var delay = FrameIntervalMs - elapsed;
+                var delay = _frameIntervalMs - elapsed;
                 if (delay > 0)
                     await Task.Delay(delay, cancellationToken);
             }
         }
     }
 
-    private static async Task ReceiveLoopAsync(MessageStream stream, int screenWidth, int screenHeight, CancellationToken cancellationToken)
+    private async Task ReceiveLoopAsync(MessageStream stream, int screenWidth, int screenHeight, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {

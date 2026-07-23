@@ -1,6 +1,6 @@
 # RemoteController
 
-局域网远程控制方案（画面传输 + 键鼠转发），.NET 10。
+局域网远程控制方案（H.264 画面传输 + 键鼠转发），.NET 10。
 
 > **安全提示**：当前版本无鉴权、无加密，仅限可信局域网使用。
 
@@ -9,8 +9,8 @@
 | 项目 | 说明 |
 | --- | --- |
 | `RemoteController.Shared` | 二进制协议（长度前缀分帧）与消息读写，被双方引用 |
-| `RemoteController.Host` | 被控端（仅 Windows）：DXGI Desktop Duplication 抓屏 → JPEG 推流，`SendInput` 注入键鼠 |
-| `RemoteController.Client` | 控制端（Avalonia + ReactiveUI）：连接、显示画面、采集键鼠转发 |
+| `RemoteController.Host` | 被控端（仅 Windows）：DXGI Desktop Duplication 抓屏 → NV12 → MediaFoundation H.264 编码推流（有硬编用硬编），`SendInput` 注入键鼠 |
+| `RemoteController.Client` | 控制端（Avalonia + ReactiveUI，仅 Windows）：连接、MediaFoundation 解码显示画面、采集键鼠转发 |
 
 ## 使用
 
@@ -32,11 +32,11 @@ dotnet run --project RemoteController.Client
 
 `[int32 bodyLength][byte messageType][payload]`
 
-- 握手：Client → `ClientHello(version)`；Host → `ServerHello(version, width, height)`
-- 推流：Host 推送 `Frame(width, height, jpeg)`，约 30 FPS 上限；基于 DXGI Desktop Duplication，画面无变化时不推帧（空闲零带宽、零编码开销）
+- 握手：Client → `ClientHello(version)`；Host → `ServerHello(version, width, height)`，当前版本 2
+- 推流：Host 推送 `VideoFrame(timestamp, keyframe, data)`，约 30 FPS 上限；data 为 H.264 Annex B 裸流访问单元，会话首帧必为关键帧且前置 SPS/PPS；基于 DXGI Desktop Duplication，画面无变化时不推帧（空闲零带宽、零编码开销）
 - 输入：`MouseMove(x,y)` / `MouseButton(btn,down)` / `MouseWheel(steps)` / `KeyEvent(vk,down)`，坐标为远端物理像素，键盘为 Windows VK 码
 
 ## 已知限制 / 后续方向
 
-- 仅主显示器；无鉴权加密；无剪贴板/文件传输
-- 编码可升级差量帧/H.264；跨公网需中继或打洞
+- 仅主显示器；无鉴权加密；无剪贴板/文件传输；控制端仅 Windows（依赖 MediaFoundation 解码）
+- 跨公网需中继或打洞；编码延迟可再优化（低延迟模式 / 关闭 B 帧）

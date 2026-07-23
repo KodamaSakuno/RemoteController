@@ -1,8 +1,9 @@
 using System;
-using System.IO;
-using System.Reactive;
+using System.Threading;
 using System.Threading.Tasks;
+using Avalonia;
 using Avalonia.Media.Imaging;
+using Avalonia.Platform;
 using Avalonia.Threading;
 using ReactiveUI;
 using RemoteController.Client.Services;
@@ -20,10 +21,12 @@ public class MainViewModel : ViewModelBase
     private Bitmap? _currentFrame;
     private int _remoteWidth;
     private int _remoteHeight;
+    private H264Decoder? _decoder;
+    private int _uiFramePending;
 
     public MainViewModel()
     {
-        _connection.FrameReceived += OnFrameReceived;
+        _connection.VideoFrameReceived += OnVideoFrameReceived;
         _connection.Disconnected += OnDisconnected;
 
         ConnectCommand = ReactiveCommand.CreateFromTask(
@@ -78,9 +81,9 @@ public class MainViewModel : ViewModelBase
 
     public RemoteConnection Connection => _connection;
 
-    public ReactiveCommand<Unit, Unit> ConnectCommand { get; }
+    public ReactiveCommand<System.Reactive.Unit, System.Reactive.Unit> ConnectCommand { get; }
 
-    public ReactiveCommand<Unit, Unit> DisconnectCommand { get; }
+    public ReactiveCommand<System.Reactive.Unit, System.Reactive.Unit> DisconnectCommand { get; }
 
     private async Task ConnectAsync()
     {
@@ -96,6 +99,9 @@ public class MainViewModel : ViewModelBase
             var (width, height) = await _connection.ConnectAsync(Address.Trim(), port);
             RemoteWidth = width;
             RemoteHeight = height;
+            _decoder?.Dispose();
+            _decoder = new H264Decoder(width, height);
+            DisposeFrameBuffers();
             IsConnected = true;
             Status = $"已连接 {Address.Trim()}:{port}（远端 {width}×{height}）";
         }
@@ -105,27 +111,78 @@ public class MainViewModel : ViewModelBase
         }
     }
 
-    private void OnFrameReceived(FrameMessage frame)
+    private readonly WriteableBitmap?[] _frameBuffers = new WriteableBitmap?[2];
+    private int _frameBufferIndex = 1; // the first NextFrameBuffer() call flips this to buffer 0
+
+    private void OnVideoFrameReceived(VideoFrameMessage frame)
     {
-        // Decode off the UI thread, then swap on the UI thread.
-        var bitmap = new Bitmap(new MemoryStream(frame.JpegData, writable: false));
+        if (_decoder is null)
+            return;
+        _decoder.Decode(frame.Data, frame.Timestamp, OnDecodedNv12);
+    }
+
+    /// <summary>Runs on the connection's receive thread; converts straight out of the decoder's buffer.</summary>
+    private unsafe void OnDecodedNv12(IntPtr data, int stride, int width, int height)
+    {
+        var bitmap = NextFrameBuffer();
+        using (var target = bitmap.Lock())
+        {
+            if (_decoder!.OutputIsBgra)
+            {
+                Nv12Converter.CopyBgra(
+                    (byte*)data, stride,
+                    (byte*)target.Address, target.RowBytes, RemoteWidth, RemoteHeight);
+            }
+            else
+            {
+                Nv12Converter.ToBgra(
+                    (byte*)data, width, height,
+                    (byte*)target.Address, target.RowBytes, RemoteWidth, RemoteHeight);
+            }
+        }
+
+        // Two reusable buffers alternate, so the Source reference always changes and the
+        // binding refreshes — but if the UI has not rendered the previous frame yet, skip
+        // presenting this one instead of queueing up work.
+        if (Interlocked.Exchange(ref _uiFramePending, 1) != 0)
+            return;
+
         Dispatcher.UIThread.Post(() =>
         {
-            var old = CurrentFrame;
+            _uiFramePending = 0;
             CurrentFrame = bitmap;
-            old?.Dispose();
         });
+    }
+
+    private WriteableBitmap NextFrameBuffer()
+    {
+        _frameBufferIndex ^= 1;
+        return _frameBuffers[_frameBufferIndex] ??= new WriteableBitmap(
+            new PixelSize(RemoteWidth, RemoteHeight), new Vector(96, 96),
+            PixelFormat.Bgra8888, AlphaFormat.Opaque);
     }
 
     private void OnDisconnected(string reason)
     {
+        // Invoked on the connection's receive thread, which is also the only thread
+        // the decoder is used on — safe to dispose here.
+        _decoder?.Dispose();
+        _decoder = null;
+
         Dispatcher.UIThread.Post(() =>
         {
             IsConnected = false;
             Status = $"已断开：{reason}";
-            var old = CurrentFrame;
             CurrentFrame = null;
-            old?.Dispose();
+            DisposeFrameBuffers();
         });
+    }
+
+    private void DisposeFrameBuffers()
+    {
+        _frameBuffers[0]?.Dispose();
+        _frameBuffers[1]?.Dispose();
+        _frameBuffers[0] = _frameBuffers[1] = null;
+        _frameBufferIndex = 1; // see the field comment
     }
 }

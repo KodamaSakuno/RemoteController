@@ -11,5 +11,5 @@ public enum MessageType : byte
 
     // Host -> Client
     ServerHello = 0x02,
-    Frame = 0x03,
+    VideoFrame = 0x04,
 }

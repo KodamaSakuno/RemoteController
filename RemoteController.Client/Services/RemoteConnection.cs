@@ -17,7 +17,7 @@ public sealed class RemoteConnection : IDisposable
     private MessageStream? _stream;
     private volatile bool _disconnectRequested;
 
-    public event Action<FrameMessage>? FrameReceived;
+    public event Action<VideoFrameMessage>? VideoFrameReceived;
 
     /// <summary>Raised when the session ends for any reason; the argument is a human-readable reason.</summary>
     public event Action<string>? Disconnected;
@@ -103,8 +103,8 @@ public sealed class RemoteConnection : IDisposable
                     break;
                 }
 
-                if (message is FrameMessage frame)
-                    FrameReceived?.Invoke(frame);
+                if (message is VideoFrameMessage frame)
+                    VideoFrameReceived?.Invoke(frame);
             }
         }
         catch (Exception ex)

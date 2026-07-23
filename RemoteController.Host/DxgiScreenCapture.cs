@@ -1,5 +1,3 @@
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using Vortice.D3DCompiler;
 using Vortice.Direct3D;
@@ -9,19 +7,17 @@ using Vortice.DXGI;
 namespace RemoteController.Host;
 
 /// <summary>
-/// Captures the primary display via DXGI Desktop Duplication and encodes frames as JPEG.
-/// Acquired frames arrive in the panel's native scanout orientation; when the display runs
-/// in a rotated mode (e.g. a portrait panel set to landscape) they are rotated back to the
-/// desktop orientation on the GPU (a fullscreen quad with rotated UVs) before readback.
-/// <see cref="CaptureJpeg"/> returns null when the desktop has not changed, so an idle
-/// desktop costs neither bandwidth nor encode CPU. Windows 8+ only.
+/// Captures the primary display via DXGI Desktop Duplication and returns frames as NV12
+/// (the pixel format H.264 encoder MFTs consume). Acquired frames arrive in the panel's
+/// native scanout orientation; when the display runs in a rotated mode (e.g. a portrait
+/// panel set to landscape) they are rotated back to the desktop orientation on the GPU
+/// (a fullscreen quad with rotated UVs) before readback. <see cref="CaptureNv12"/> returns
+/// null when the desktop has not changed, so an idle desktop costs neither bandwidth nor
+/// encode CPU. Windows 8+ only.
 /// </summary>
 public sealed class DxgiScreenCapture : IDisposable
 {
     private const uint AcquireTimeoutMs = 100;
-
-    private static readonly ImageCodecInfo JpegCodec =
-        ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == ImageFormat.Jpeg.Guid);
 
     // Textured fullscreen quad used to rotate a frame on the GPU.
     private const string RotationShaderSource = """
@@ -57,11 +53,10 @@ public sealed class DxgiScreenCapture : IDisposable
     private readonly ID3D11Device _device;
     private readonly ID3D11DeviceContext _context;
     private readonly IDXGIOutput1 _output;
-    private readonly EncoderParameters _jpegParams;
 
     private IDXGIOutputDuplication? _duplication;
     private ID3D11Texture2D? _staging;
-    private Bitmap? _encodeBuffer;
+    private byte[]? _nv12;
 
     // GPU rotation pipeline, created lazily and only used when the display is rotated.
     private ID3D11Texture2D? _rotated;
@@ -77,12 +72,13 @@ public sealed class DxgiScreenCapture : IDisposable
     private ModeRotation _rotation;
     private int _rawWidth;
     private int _rawHeight;
+    private int _catchUpDiscards;
 
-    public DxgiScreenCapture(long quality = 70)
+    /// <summary>Stale frames discarded by the acquisition catch-up (diagnostics).</summary>
+    public int CatchUpDiscards => _catchUpDiscards;
+
+    public DxgiScreenCapture()
     {
-        _jpegParams = new EncoderParameters(1);
-        _jpegParams.Param[0] = new EncoderParameter(Encoder.Quality, quality);
-
         (_device, _context, _output) = CreateDuplicationSource();
         Width = _output.Description.DesktopCoordinates.Right;
         Height = _output.Description.DesktopCoordinates.Bottom;
@@ -107,15 +103,16 @@ public sealed class DxgiScreenCapture : IDisposable
     private static extern bool SetProcessDPIAware();
 
     /// <summary>
-    /// Captures and JPEG-encodes the next desktop update,
-    /// or returns null when no update arrived within the acquire timeout.
+    /// Captures the next desktop update and converts it to NV12 in the desktop orientation,
+    /// or returns null when no update arrived within the acquire timeout. The returned
+    /// buffer is reused on the next call.
     /// </summary>
-    public byte[]? CaptureJpeg()
+    public byte[]? CaptureNv12()
     {
         if (_duplication is null)
             RecreateDuplication();
 
-        var result = _duplication!.AcquireNextFrame(AcquireTimeoutMs, out _, out var resource);
+        var result = _duplication!.AcquireNextFrame(AcquireTimeoutMs, out var frameInfo, out var resource);
         if (result == Vortice.DXGI.ResultCode.WaitTimeout)
             return null; // desktop unchanged
         if (result == Vortice.DXGI.ResultCode.AccessDenied)
@@ -134,6 +131,37 @@ public sealed class DxgiScreenCapture : IDisposable
 
         result.CheckError();
 
+        // Catch up only when genuinely behind. Desktop Duplication queues updates while we
+        // are busy encoding; processing the oldest one shows the past. A couple of queued
+        // frames is just normal pacing (the desktop ticks faster than our loop), so drain
+        // only once the backlog is real — otherwise we would discard the newest frame too.
+        const int CatchUpThreshold = 2;
+        while (frameInfo.AccumulatedFrames > CatchUpThreshold)
+        {
+            // A frame may not be outstanding when acquiring the next, so release first.
+            resource?.Dispose();
+            _duplication.ReleaseFrame();
+
+            var next = _duplication.AcquireNextFrame(0, out frameInfo, out var newer);
+            if (next == Vortice.DXGI.ResultCode.WaitTimeout)
+                return null; // drained in the meantime; the next capture gets a fresh frame
+            if (next == Vortice.DXGI.ResultCode.AccessDenied || next == Vortice.DXGI.ResultCode.AccessLost)
+            {
+                newer?.Dispose();
+                if (next == Vortice.DXGI.ResultCode.AccessDenied)
+                    Thread.Sleep(200);
+                else
+                    RecreateDuplication();
+                return null;
+            }
+
+            next.CheckError();
+
+            resource = newer;
+            if (++_catchUpDiscards % 300 == 1)
+                Console.WriteLine($"[Host] catching up on capture queue; {_catchUpDiscards} stale frames discarded");
+        }
+
         try
         {
             using var texture = resource!.QueryInterface<ID3D11Texture2D>();
@@ -149,7 +177,7 @@ public sealed class DxgiScreenCapture : IDisposable
                 _context.CopyResource(_staging!, _rotated!);
             }
 
-            return EncodeFrame();
+            return ReadbackNv12();
         }
         finally
         {
@@ -162,7 +190,6 @@ public sealed class DxgiScreenCapture : IDisposable
     {
         _duplication?.Dispose();
         _staging?.Dispose();
-        _encodeBuffer?.Dispose();
         _rotatedRtv?.Dispose();
         _rotated?.Dispose();
         _quadVertices?.Dispose();
@@ -230,7 +257,6 @@ public sealed class DxgiScreenCapture : IDisposable
             return;
 
         _staging?.Dispose();
-        _encodeBuffer?.Dispose();
         _rotatedRtv?.Dispose();
         _rotated?.Dispose();
         _rotatedRtv = null;
@@ -258,7 +284,7 @@ public sealed class DxgiScreenCapture : IDisposable
             BindFlags = BindFlags.None,
             CPUAccessFlags = CpuAccessFlags.Read,
         });
-        _encodeBuffer = new Bitmap(Width, Height, PixelFormat.Format32bppArgb);
+        _nv12 = new byte[Width * Height * 3 / 2];
 
         if (needsRotation)
         {
@@ -389,37 +415,61 @@ public sealed class DxgiScreenCapture : IDisposable
         _quadRotation = _rotation;
     }
 
-    private byte[] EncodeFrame()
+    /// <summary>Copies the staging texture out and converts BGRA to NV12 (BT.601 studio swing).</summary>
+    private byte[] ReadbackNv12()
     {
         var map = _context.Map(_staging!, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
         try
         {
-            var data = _encodeBuffer!.LockBits(
-                new Rectangle(0, 0, Width, Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-            try
+            var nv12 = _nv12!;
+            unsafe
             {
-                // DXGI gives BGRA rows, which is exactly Format32bppArgb's layout.
-                var rowBytes = Width * 4;
-                unsafe
-                {
-                    var src = (byte*)map.DataPointer;
-                    var dst = (byte*)data.Scan0;
-                    for (var y = 0; y < Height; y++)
-                        Buffer.MemoryCopy(src + y * map.RowPitch, dst + y * data.Stride, rowBytes, rowBytes);
-                }
+                var src = (byte*)map.DataPointer;
+                fixed (byte* dst = nv12)
+                    BgraToNv12(src, (int)map.RowPitch, dst, Width, Height);
             }
-            finally
-            {
-                _encodeBuffer.UnlockBits(data);
-            }
+
+            return nv12;
         }
         finally
         {
             _context.Unmap(_staging!, 0);
         }
+    }
 
-        using var ms = new MemoryStream();
-        _encodeBuffer!.Save(ms, JpegCodec, _jpegParams);
-        return ms.ToArray();
+    private static unsafe void BgraToNv12(byte* src, int srcPitch, byte* dst, int width, int height)
+    {
+        var uvPlane = dst + width * height;
+        // Rows are independent; a scalar per-pixel loop is the host's main CPU cost at
+        // high resolutions, so convert in parallel.
+        Parallel.For(0, height, y =>
+        {
+            var srcRow = src + y * srcPitch;
+            var dstRow = dst + y * width;
+            for (var x = 0; x < width; x++)
+            {
+                var b = srcRow[x * 4];
+                var g = srcRow[x * 4 + 1];
+                var r = srcRow[x * 4 + 2];
+                dstRow[x] = (byte)(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+            }
+        });
+
+        // 2x2-subsampled interleaved chroma; desktop modes always have even dimensions.
+        Parallel.For(0, height / 2, y2 =>
+        {
+            var y = y2 * 2;
+            var srcRow0 = src + y * srcPitch;
+            var srcRow1 = srcRow0 + srcPitch;
+            var uvRow = uvPlane + y2 * width;
+            for (var x = 0; x < width; x += 2)
+            {
+                var b = (srcRow0[x * 4] + srcRow0[x * 4 + 4] + srcRow1[x * 4] + srcRow1[x * 4 + 4] + 2) >> 2;
+                var g = (srcRow0[x * 4 + 1] + srcRow0[x * 4 + 5] + srcRow1[x * 4 + 1] + srcRow1[x * 4 + 5] + 2) >> 2;
+                var r = (srcRow0[x * 4 + 2] + srcRow0[x * 4 + 6] + srcRow1[x * 4 + 2] + srcRow1[x * 4 + 6] + 2) >> 2;
+                uvRow[x] = (byte)((-38 * r - 74 * g + 112 * b + 128 >> 8) + 128);
+                uvRow[x + 1] = (byte)((112 * r - 94 * g - 18 * b + 128 >> 8) + 128);
+            }
+        });
     }
 }

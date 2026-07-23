@@ -2,7 +2,7 @@ namespace RemoteController.Shared.Protocol;
 
 public static class ProtocolInfo
 {
-    public const int Version = 1;
+    public const int Version = 2;
 }
 
 public abstract record RemoteMessage
@@ -15,7 +15,7 @@ public abstract record RemoteMessage
     {
         MessageType.ClientHello => new ClientHelloMessage(reader.ReadInt32()),
         MessageType.ServerHello => new ServerHelloMessage(reader.ReadInt32(), reader.ReadInt32(), reader.ReadInt32()),
-        MessageType.Frame => ReadFrame(reader),
+        MessageType.VideoFrame => ReadVideoFrame(reader),
         MessageType.MouseMove => new MouseMoveMessage(reader.ReadInt32(), reader.ReadInt32()),
         MessageType.MouseButton => new MouseButtonMessage((RemoteMouseButton)reader.ReadByte(), reader.ReadBoolean()),
         MessageType.MouseWheel => new MouseWheelMessage(reader.ReadInt32()),
@@ -23,12 +23,12 @@ public abstract record RemoteMessage
         _ => throw new InvalidDataException($"Unknown message type: 0x{(byte)type:X2}"),
     };
 
-    private static FrameMessage ReadFrame(BinaryReader reader)
+    private static VideoFrameMessage ReadVideoFrame(BinaryReader reader)
     {
-        var width = reader.ReadInt32();
-        var height = reader.ReadInt32();
+        var timestamp = reader.ReadInt64();
+        var keyframe = reader.ReadBoolean();
         var data = reader.ReadBytes(reader.ReadInt32());
-        return new FrameMessage(width, height, data);
+        return new VideoFrameMessage(timestamp, keyframe, data);
     }
 }
 
@@ -51,16 +51,20 @@ public sealed record ServerHelloMessage(int Version, int ScreenWidth, int Screen
     }
 }
 
-public sealed record FrameMessage(int Width, int Height, byte[] JpegData) : RemoteMessage
+/// <summary>
+/// One H.264 access unit (Annex B byte stream). The first sample of a session is always
+/// a keyframe and has the encoder's sequence header (SPS/PPS) prepended.
+/// </summary>
+public sealed record VideoFrameMessage(long Timestamp, bool Keyframe, byte[] Data) : RemoteMessage
 {
-    public override MessageType Type => MessageType.Frame;
+    public override MessageType Type => MessageType.VideoFrame;
 
     public override void WritePayload(BinaryWriter writer)
     {
-        writer.Write(Width);
-        writer.Write(Height);
-        writer.Write(JpegData.Length);
-        writer.Write(JpegData);
+        writer.Write(Timestamp);
+        writer.Write(Keyframe);
+        writer.Write(Data.Length);
+        writer.Write(Data);
     }
 }
 
