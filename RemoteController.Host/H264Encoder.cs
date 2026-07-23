@@ -122,6 +122,7 @@ public sealed class H264Encoder : IDisposable
         if (_dxgiManager is null)
             throw new InvalidOperationException("The encoder was not set up for D3D input.");
 
+        var stage = "create surface buffer";
         try
         {
             using var sample = MediaFactory.MFCreateSample();
@@ -130,13 +131,14 @@ public sealed class H264Encoder : IDisposable
             sample.SampleTime = timestamp100ns;
             sample.SampleDuration = duration100ns;
 
+            stage = "process input";
             var output = new List<(byte[] Data, bool Keyframe)>();
             EncodeSample(sample, output);
             return output;
         }
         catch (Exception ex)
         {
-            throw new InvalidOperationException($"surface sample feed failed: {ex.Message}", ex);
+            throw new InvalidOperationException($"surface sample feed ({stage}) failed: {ex.Message}", ex);
         }
     }
 
