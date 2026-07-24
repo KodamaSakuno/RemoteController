@@ -111,8 +111,10 @@ public class MainViewModel : ViewModelBase
         }
     }
 
-    private readonly WriteableBitmap?[] _frameBuffers = new WriteableBitmap?[2];
-    private int _frameBufferIndex = 1; // the first NextFrameBuffer() call flips this to buffer 0
+    private readonly WriteableBitmap?[] _frameBuffers = new WriteableBitmap?[3];
+    private readonly object _bufferSelection = new();
+    private int _presentedIndex = -1; // last buffer handed to the UI; the compositor may still sample it
+    private int _previousIndex = -1;  // the one before that; may still be draining a render pass
 
     private void OnVideoFrameReceived(VideoFrameMessage frame)
     {
@@ -124,7 +126,32 @@ public class MainViewModel : ViewModelBase
     /// <summary>Runs on the connection's receive thread; converts straight out of the decoder's buffer.</summary>
     private unsafe void OnDecodedNv12(IntPtr data, int stride, int width, int height)
     {
-        var bitmap = NextFrameBuffer();
+        // A present is still in flight: drop this frame (the decoder was still fed, so the
+        // stream stays intact) instead of queueing work for the UI. Checked before the
+        // conversion so a lagging UI does not turn into wasted CPU.
+        if (_uiFramePending != 0)
+            return;
+
+        // Three buffers cycle; the UI owns the two most recently presented ones and the
+        // compositor may still be sampling either, so conversion only ever targets the
+        // third. Writing into a buffer the compositor reads shows as tearing/black
+        // flashes — most visible exactly when the picture changes.
+        int index;
+        lock (_bufferSelection)
+        {
+            index = 0;
+            for (var i = 0; i < _frameBuffers.Length; i++)
+                if (i != _presentedIndex && i != _previousIndex)
+                {
+                    index = i;
+                    break;
+                }
+        }
+
+        var bitmap = _frameBuffers[index] ??= new WriteableBitmap(
+            new PixelSize(RemoteWidth, RemoteHeight), new Vector(96, 96),
+            PixelFormat.Bgra8888, AlphaFormat.Opaque);
+
         using (var target = bitmap.Lock())
         {
             if (_decoder!.OutputIsBgra)
@@ -141,25 +168,20 @@ public class MainViewModel : ViewModelBase
             }
         }
 
-        // Two reusable buffers alternate, so the Source reference always changes and the
-        // binding refreshes — but if the UI has not rendered the previous frame yet, skip
-        // presenting this one instead of queueing up work.
         if (Interlocked.Exchange(ref _uiFramePending, 1) != 0)
             return;
 
         Dispatcher.UIThread.Post(() =>
         {
             _uiFramePending = 0;
+            lock (_bufferSelection)
+            {
+                _previousIndex = _presentedIndex;
+                _presentedIndex = index;
+            }
+
             CurrentFrame = bitmap;
         });
-    }
-
-    private WriteableBitmap NextFrameBuffer()
-    {
-        _frameBufferIndex ^= 1;
-        return _frameBuffers[_frameBufferIndex] ??= new WriteableBitmap(
-            new PixelSize(RemoteWidth, RemoteHeight), new Vector(96, 96),
-            PixelFormat.Bgra8888, AlphaFormat.Opaque);
     }
 
     private void OnDisconnected(string reason)
@@ -180,9 +202,12 @@ public class MainViewModel : ViewModelBase
 
     private void DisposeFrameBuffers()
     {
-        _frameBuffers[0]?.Dispose();
-        _frameBuffers[1]?.Dispose();
-        _frameBuffers[0] = _frameBuffers[1] = null;
-        _frameBufferIndex = 1; // see the field comment
+        for (var i = 0; i < _frameBuffers.Length; i++)
+        {
+            _frameBuffers[i]?.Dispose();
+            _frameBuffers[i] = null;
+        }
+
+        _presentedIndex = _previousIndex = -1;
     }
 }

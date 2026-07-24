@@ -63,23 +63,33 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
                 var sendTask = StreamLoopAsync(stream, capture, screenWidth, screenHeight, sessionCts.Token);
                 var receiveTask = ReceiveLoopAsync(stream, screenWidth, screenHeight, sessionCts.Token);
 
-                await Task.WhenAny(sendTask, receiveTask);
-                await sessionCts.CancelAsync();
+                // A display that times out mid-session streams as black frames; hold it
+                // awake for the session (reference-counted across concurrent clients).
+                DisplayPower.KeepAwake();
                 try
                 {
-                    await Task.WhenAll(sendTask, receiveTask);
+                    await Task.WhenAny(sendTask, receiveTask);
+                    await sessionCts.CancelAsync();
+                    try
+                    {
+                        await Task.WhenAll(sendTask, receiveTask);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // expected during teardown
+                    }
+                    catch (IOException)
+                    {
+                        // connection dropped mid-session; the disconnect log line covers it
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[Host] Stream loop error ({endpoint}): {ex.Message}");
+                    }
                 }
-                catch (OperationCanceledException)
+                finally
                 {
-                    // expected during teardown
-                }
-                catch (IOException)
-                {
-                    // connection dropped mid-session; the disconnect log line covers it
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[Host] Stream loop error ({endpoint}): {ex.Message}");
+                    DisplayPower.Release();
                 }
             }
         }
@@ -103,6 +113,8 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
 
         var useGpu = true;
         var gpuConversionFailed = false;
+        var dozing = false;
+        var suppressedBlack = 0L;
         var encoder = NewEncoder(useGpu);
 
         H264Encoder NewEncoder(bool gpu)
@@ -175,7 +187,37 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
 
                     nv12 ??= capture.CaptureNv12();
                     if (nv12 is not null)
-                        outputs = encoder.Encode(nv12, timestamp, 333_333);
+                    {
+                        // A dozing display pipeline delivers black frames (luma pinned at
+                        // the studio-swing black level); sending them flashes the client's
+                        // picture black. The desktop is effectively frozen while dozing, so
+                        // suppress the frames instead — the client keeps the last real one.
+                        if (IsBlackFrame(nv12, screenWidth * screenHeight))
+                        {
+                            suppressedBlack++;
+                            if (!dozing)
+                            {
+                                dozing = true;
+                                Console.WriteLine("[Host] display pipeline is dozing (black frames); suppressing until it wakes");
+                            }
+
+                            // While dozing the compositor still feeds black frames nearly
+                            // continuously; without pacing we would capture, convert and
+                            // discard in a hot loop. Poll gently instead — the desktop is
+                            // effectively frozen anyway.
+                            await Task.Delay(100, cancellationToken);
+                        }
+                        else
+                        {
+                            if (dozing)
+                            {
+                                dozing = false;
+                                Console.WriteLine($"[Host] display woke; {suppressedBlack} black frames suppressed");
+                            }
+
+                            outputs = encoder.Encode(nv12, timestamp, 333_333);
+                        }
+                    }
                 }
 
                 if (outputs is not null)
@@ -218,6 +260,19 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
         {
             encoder.Dispose();
         }
+    }
+
+    /// <summary>True when the NV12 frame is essentially all black — the signature of a
+    /// dozing display pipeline (luma pinned at the studio-swing black level of 16, plus
+    /// encoder noise), not of a real desktop (even a dark one has brighter pixels).
+    /// Samples every 7th luma byte; sub-millisecond at 1600p.</summary>
+    private static bool IsBlackFrame(byte[] nv12, int yPlaneSize)
+    {
+        byte max = 0;
+        for (var i = 0; i < yPlaneSize; i += 7)
+            if (nv12[i] > max)
+                max = nv12[i];
+        return max < 24;
     }
 
     private async Task ReceiveLoopAsync(MessageStream stream, int screenWidth, int screenHeight, CancellationToken cancellationToken)

@@ -8,7 +8,7 @@
 | --- | --- |
 | `RemoteController.Shared` | 二进制协议（长度前缀分帧），被双方引用 |
 | `RemoteController.Host` | 被控端（控制台）：DXGI Desktop Duplication 抓屏 → MediaFoundation H.264 编码 → TCP 推流；`SendInput` 注入键鼠 |
-| `RemoteController.Client` | 控制端（Avalonia + ReactiveUI）：MF 解码 → `WriteableBitmap` 乒乓双缓冲显示；采集键鼠转发 |
+| `RemoteController.Client` | 控制端（Avalonia + ReactiveUI）：MF 解码 → `WriteableBitmap` 三缓冲轮换显示（绝不写入合成器可能在读的两块）；采集键鼠转发 |
 
 协议 v2：`[int32 bodyLength][byte type][payload]`，小端。`VideoFrame(timestamp, keyframe, data)` 为 H.264 Annex B 访问单元，首帧必为关键帧且前置 SPS/PPS（编码器输出类型里读不到 `MF_MT_MPEG_SEQUENCE_HEADER` 的 MFT 靠码流内嵌）。
 
@@ -25,7 +25,7 @@ dotnet run --project RemoteController.Client
 
 ## 本地验证回路（重要）
 
-- **裸协议探针**（`.scratch/probe`，控制台，已 gitignore）：`--stream [port] [秒]` 连 Host 握手收帧、校验首帧 SPS/PPS/IDR 结构并报 fps/码率；`--dump [目录]` 各抓一帧 `CaptureNv12Gpu`/`CaptureNv12` 写成 PNG 并比对两路 NV12 逐字节差（转换正确性回归）。用于不依赖 GUI 的快速回归。
+- **裸协议探针**（`.scratch/probe`，控制台，已 gitignore）：`--stream [port] [秒]` 连 Host 握手收帧、校验首帧 SPS/PPS/IDR 结构并报 fps/码率；`--dump [目录]` 各抓一帧 `CaptureNv12Gpu`/`CaptureNv12` 写成 PNG 并比对两路 NV12 逐字节差（转换正确性回归）；`--monitor [N]` 连续 N 帧统计黑帧（max Y<24）；`--panel-test [秒] [es]` 每秒一帧分类，观察息屏黑帧转折点及 ES 保持效果；`--display on|off` 广播 SC_MONITORPOWER。用于不依赖 GUI 的快速回归。
 - **无头基准**：`Avalonia.Headless` 起无窗客户端跑真实接收-解码-显示路径（初始化后必须 `SynchronizationContext.SetSynchronizationContext(null)`，否则 await 全部挂死）。
 - **表面接受矩阵探针**（`tools/SurfaceProbe`，已入库）：对首个硬件 H.264 编码 MFT 跑"完整 MFT 仪式"（async 解锁 → 协商 → D3D 管理器 → BeginStreaming → NeedInput 门控 → ProcessInput → drain）下的纹理形态矩阵（bind/misc 标志 × NV12/P010 × 采样创建方式 × 设备变体）加判别实验（manager 对内存输入的影响、LockDevice、feature level）。改捕获/编码路径前先跑它。
 - 调试经验：**凡是跨端/驱动相关问题，先打"阶段标签"日志**（每个可疑调用一段 `stage` 字符串，异常时带出来），一次定位，拒绝盲猜。
@@ -53,6 +53,7 @@ dotnet run --project RemoteController.Client
 14. **Adreno 不接受 NV12 作为绘制目标**：改为渲到 R8/R8G8 平面纹理再 `CopySubresourceRegion` 进 NV12 平面。
 15. **设过 D3D 管理器的 MFT 不再接受系统内存输入**（native 0xC0000005 崩溃）。GPU 路径失败回退 CPU 时必须**新建一个不带管理器的编码器**，不能只翻标志位。
 16. **NV12 读回别走 planar staging**：NV12 staging 纹理配 keyed-mutex 源拷贝是 `E_INVALIDARG` 雷区。ffmpeg（hwcontext_d3d11va）也只 map 子资源 0 当整块 blob 读。本项目用两个单平面 staging（R8 + R8G8）分别 map，最稳。
+17. **平板无人值守 → 显示管线休眠 → 采集全黑帧**：超时后 DXGI 抓屏**不报错、照常用帧返回，内容全黑（Y 恒为 16）**——客户端表现为"时不时黑屏闪烁"，且管线会以数 Hz 在休眠/唤醒间振荡（任何可见桌面更新都唤醒它，控制台打印也算），所以黑帧是成串突发的而非持续。`SendInput` 注入的远程输入**不重置显示空闲计时器**。**`SetThreadExecutionState(ES_DISPLAY_REQUIRED)` 在本机实测防不住**（录制会话中 2/3 帧是黑的，ES 全程持有）。有效对策是**黑帧抑制**：`IsBlackFrame`（Y 平面抽样 max<24）命中的帧不编码不发送——休眠时桌面本来就是冻结的，客户端留住最后一帧真实画面即正确体验；抑制期加 100ms 节流，否则采集-转换-丢弃空转成热循环（实测曾 ~74 帧/秒空转）。`DisplayPower.KeepAwake()`（ES + `SC_MONITORPOWER` 尽力唤醒）仍保留——对其他机器可能有效，且零成本。锁屏后 `DuplicateOutput` 报 `E_ACCESSDENIED`（会话报错断开）。验证回路：`--record` 录码流 + `--check` 逐帧解码统计黑帧。
 
 ### 设备差异（实测）
 
@@ -65,6 +66,7 @@ dotnet run --project RemoteController.Client
 - **CPU 路径全链路工作**（所有设备）：抓屏 → GPU 旋转 → **GPU 渲染 NV12 + 单平面读回**（1.5 字节/像素、纯 memcpy，替代原 BGRA 读回 + CPU 逐像素转换）→ 编码推流 → 解码显示，亚秒延迟（平板建议 `--fps 20 --bitrate 10`）。GPU 转换失败时自动回退纯 CPU 转换（`CaptureNv12`）。
 - **GPU 路径（零拷贝喂纹理）**：Intel 上走通（RGB32 直接喂）；QCOM 已由探针定论不支持表面输入，自动安全回退 CPU 路径（重建编码器，不崩）。
 - RGB32 输入只在传入 D3D 设备时协商：无设备的回退编码器固定 NV12 输入，与内存喂帧路径保持一致。
+- 会话期间 Host 通过 `DisplayPower`（SetThreadExecutionState + SC_MONITORPOWER 尽力唤醒）保持被控端屏幕常亮，并对采集到的休眠黑帧做抑制（`IsBlackFrame`，不编码不发送，客户端留住最后真实帧；抑制期 100ms 节流防空转），杜绝屏幕休眠导致的黑帧推流（见平台知识库 #17）。
 - QCOM 纹理问题已结案（见"设备差异"）：非配置问题，是该 MFT 驱动根本不接受 DXGI 表面输入；零拷贝念想止步于此，GPU NV12 渲染 + 读回是该设备的最优形态。
 
 ## 约定
