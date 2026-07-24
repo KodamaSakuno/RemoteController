@@ -16,11 +16,13 @@
 
 ```bash
 dotnet build RemoteController.slnx          # 全量构建
-dotnet run --project RemoteController.Host -- --port 47800 --fps 20 --bitrate 10
+dotnet run --project RemoteController.Host -- --port 47800 --fps 20 --bitrate 10 --raw-port 47801
 dotnet run --project RemoteController.Client
 ```
 
-- Host 参数：`--port`（默认 47800）、`--fps`（默认 30）、`--bitrate`（Mbps，默认 8）。
+- Host 参数：`--port`（默认 47800）、`--fps`（默认 30）、`--bitrate`（Mbps，默认 8）、`--raw-port`（默认关；开启后在该端口输出**无协议的 Annex B H.264 裸流**，首帧前置 SPS/PPS，供外部播放器使用）。
+- 用 ffplay 看画面：`ffplay -f h264 -fflags nobuffer -flags low_delay tcp://<被控端IP>:47801`（裸流无时间戳，节奏不对就加 `-framerate 20`）。
+- raw 端口与协议端口各自独立起会话（独立的抓屏+编码实例），互不干扰；黑帧抑制在两条路径上都生效（休眠时画面定格）。
 - 修改 Host 代码后重跑前，先杀掉旧 `RemoteController.Host` 进程，否则 exe 被锁、构建失败。
 
 ## 本地验证回路（重要）

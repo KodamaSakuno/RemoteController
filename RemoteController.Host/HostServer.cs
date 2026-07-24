@@ -5,7 +5,7 @@ using RemoteController.Shared.Protocol;
 
 namespace RemoteController.Host;
 
-public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
+public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000, int rawPort = 0)
 {
     private readonly int _frameIntervalMs = 1000 / fps;
 
@@ -17,6 +17,18 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
         var listener = new TcpListener(IPAddress.Any, port);
         listener.Start();
         Console.WriteLine($"[Host] Listening on 0.0.0.0:{port}");
+
+        // Optional second port: the same video as a raw Annex B H.264 byte stream,
+        // playable with ffplay -f h264 tcp://<host>:<rawPort>.
+        TcpListener? rawListener = null;
+        if (rawPort > 0)
+        {
+            rawListener = new TcpListener(IPAddress.Any, rawPort);
+            rawListener.Start();
+            Console.WriteLine($"[Host] Raw H.264 stream on 0.0.0.0:{rawPort} — ffplay -f h264 -fflags nobuffer tcp://<host>:{rawPort}");
+            _ = AcceptRawLoopAsync(rawListener, cancellationToken);
+        }
+
         Console.WriteLine("[Host] WARNING: no authentication or encryption — use on trusted LANs only.");
 
         try
@@ -34,7 +46,60 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
         finally
         {
             listener.Stop();
+            rawListener?.Stop();
         }
+    }
+
+    private async Task AcceptRawLoopAsync(TcpListener listener, CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var client = await listener.AcceptTcpClientAsync(cancellationToken);
+                _ = HandleRawClientAsync(client);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // shutting down
+        }
+    }
+
+    /// <summary>Serves one raw-stream client: no handshake, no input channel — just the
+    /// encoded Annex B access units written back-to-back (SPS/PPS precede the first keyframe).</summary>
+    private async Task HandleRawClientAsync(TcpClient client)
+    {
+        var endpoint = client.Client.RemoteEndPoint;
+        Console.WriteLine($"[Host] raw stream client connected: {endpoint}");
+
+        try
+        {
+            using (client)
+            {
+                client.NoDelay = true;
+                using var capture = new DxgiScreenCapture();
+                var socket = client.GetStream();
+
+                DisplayPower.KeepAwake();
+                try
+                {
+                    await CaptureEncodeLoopAsync(capture, capture.Width, capture.Height,
+                        (timestamp, payload, keyframe) => socket.WriteAsync(payload, 0, payload.Length),
+                        CancellationToken.None);
+                }
+                finally
+                {
+                    DisplayPower.Release();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Host] raw stream error ({endpoint}): {ex.Message}");
+        }
+
+        Console.WriteLine($"[Host] raw stream client disconnected: {endpoint}");
     }
 
     private async Task HandleClientAsync(TcpClient client)
@@ -111,6 +176,20 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
         // ReceiveLoopAsync from ever being started.
         await Task.Yield();
 
+        await CaptureEncodeLoopAsync(capture, screenWidth, screenHeight,
+            (timestamp, payload, keyframe) => stream.WriteAsync(new VideoFrameMessage(timestamp, keyframe, payload), cancellationToken),
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// The shared capture→encode→send loop behind both the protocol stream and the raw
+    /// H.264 port. <paramref name="sendAccessUnitAsync"/> receives (wall-clock timestamp,
+    /// Annex B payload, keyframe flag); the first payload passed is always a keyframe
+    /// preceded by the sequence header, so consumers can start decoding mid-stream.
+    /// </summary>
+    private async Task CaptureEncodeLoopAsync(DxgiScreenCapture capture, int screenWidth, int screenHeight,
+        Func<long, byte[], bool, Task> sendAccessUnitAsync, CancellationToken cancellationToken)
+    {
         var useGpu = true;
         var gpuConversionFailed = false;
         var dozing = false;
@@ -243,7 +322,7 @@ public sealed class HostServer(int port, int fps = 30, uint bitrate = 8_000_000)
                             headerSent = true;
                         }
 
-                        await stream.WriteAsync(new VideoFrameMessage(timestamp, keyframe, payload), cancellationToken);
+                        await sendAccessUnitAsync(timestamp, payload, keyframe);
                         if (sent == 0)
                             Console.WriteLine($"[Host] first frame sent (+{Clock.ElapsedMilliseconds} ms)");
                         sent++;
