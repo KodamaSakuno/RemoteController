@@ -10,7 +10,6 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Media.Imaging;
-using Avalonia.Platform;
 using Avalonia.Threading;
 using RemoteController.Protocol;
 using ProtocolMouseButton = RemoteController.Protocol.MouseButton;
@@ -20,7 +19,8 @@ namespace RemoteController.Client;
 public partial class MainWindow : Window
 {
     private ClientWebSocket? _socket;
-    private WriteableBitmap? _bitmap;
+    private Bitmap? _bitmap;
+    private Bitmap? _prevBitmap; // 渲染管线可能仍持有上一帧，延迟一帧再释放
     private Size _serverSize;
     private int _regionOriginX;
     private int _regionOriginY;
@@ -194,37 +194,15 @@ public partial class MainWindow : Window
         }
     }
 
-    private unsafe void HandleFrame(FrameHeader header, byte[] payload)
+    private void HandleFrame(FrameHeader header, byte[] payload)
     {
         _frameCount++;
         StatusText.Text = $"帧 #{_frameCount}";
 
-        if (_bitmap is null || _bitmap.PixelSize.Width != header.Width || _bitmap.PixelSize.Height != header.Height)
-        {
-            _bitmap?.Dispose();
-            _bitmap = new WriteableBitmap(
-                new PixelSize(header.Width, header.Height),
-                new Vector(96, 96),
-                PixelFormat.Bgra8888,
-                AlphaFormat.Opaque);
-            FrameImage.Source = _bitmap;
-        }
-
-        // DIB 段无行对齐填充（宽度*4 恒为 4 的倍数），但位图行距仍按实际 RowBytes 逐行拷贝
-        using (var framebuffer = _bitmap.Lock())
-        {
-            var rowBytes = header.Width * 4;
-            fixed (byte* src = payload)
-            {
-                for (var y = 0; y < header.Height; y++)
-                {
-                    var dst = (byte*)framebuffer.Address.ToPointer() + y * framebuffer.RowBytes;
-                    Buffer.MemoryCopy(src + y * rowBytes, dst, framebuffer.RowBytes, rowBytes);
-                }
-            }
-        }
-
-        // 原地写入不会使已上传纹理失效，显式触发重绘
-        FrameImage.InvalidateVisual();
+        // 每帧解码新位图：解码由 Skia 完成，替换 Source 即触发重绘
+        _prevBitmap?.Dispose();
+        _prevBitmap = _bitmap;
+        _bitmap = new Bitmap(new MemoryStream(payload, writable: false));
+        FrameImage.Source = _bitmap;
     }
 }

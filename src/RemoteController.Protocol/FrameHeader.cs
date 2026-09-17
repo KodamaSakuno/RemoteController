@@ -2,7 +2,7 @@ using System.Buffers.Binary;
 
 namespace RemoteController.Protocol;
 
-/// <summary>图像帧的 16 字节二进制头，负载为 BGRA32 像素。</summary>
+/// <summary>图像帧的 16 字节二进制头，负载为 JPEG 字节流。</summary>
 public readonly struct FrameHeader
 {
     public const int Size = 16;
