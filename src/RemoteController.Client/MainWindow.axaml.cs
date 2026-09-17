@@ -35,6 +35,8 @@ public partial class MainWindow : Window
         var args = Environment.GetCommandLineArgs();
         if (args.Length > 1)
             HostBox.Text = args[1];
+        else if (ClientSettings.Load() is { LastHost: { } lastHost })
+            HostBox.Text = lastHost;
 
         FrameImage.PointerMoved += OnPointerMoved;
         FrameImage.PointerPressed += OnPointerButton;
@@ -124,6 +126,7 @@ public partial class MainWindow : Window
             var host = HostBox.Text?.Trim() ?? string.Empty;
             await _socket.ConnectAsync(new Uri($"ws://{host}:5080/ws"), CancellationToken.None);
             StatusText.Text = "已连接";
+            new ClientSettings(host).Save();
             _ = ReceiveLoopAsync(_socket);
         }
         catch (Exception ex)
