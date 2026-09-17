@@ -44,7 +44,11 @@ public partial class MainWindow : Window
     private void OnPointerMoved(object? sender, PointerEventArgs e)
     {
         if (TryMapToServer(e, out var x, out var y))
+        {
             Send(new MouseMove(x, y));
+            // 临时：映射联调回显，鼠标转发验收后移除
+            StatusText.Text = $"帧 #{_frameCount} → {x},{y}";
+        }
     }
 
     private void OnPointerButton(object? sender, PointerEventArgs e)
@@ -75,19 +79,14 @@ public partial class MainWindow : Window
         if (_textureSize is { Width: <= 0 } or { Height: <= 0 })
             return false;
 
-        // Bounds 是纹理方向的布局矩形；视觉经 RenderTransform 旋转，指针需反向旋回
         var bounds = FrameImage.Bounds;
         if (bounds.Width <= 0 || bounds.Height <= 0)
             return false;
 
+        // GetPosition 已把指针逆变换到控件本地（纹理方向）坐标，无需再手动逆旋转
         var position = e.GetPosition(FrameImage);
-        var radians = -_rotation * Math.PI / 180;
-        var cos = Math.Cos(radians);
-        var sin = Math.Sin(radians);
-        var dx = position.X - bounds.Width / 2;
-        var dy = position.Y - bounds.Height / 2;
-        var u = (dx * cos - dy * sin) / bounds.Width + 0.5;
-        var v = (dx * sin + dy * cos) / bounds.Height + 0.5;
+        var u = position.X / bounds.Width;
+        var v = position.Y / bounds.Height;
         if (u is < 0 or > 1 || v is < 0 or > 1)
             return false; // 落在旋转后视觉的黑区，不产生注入
 
