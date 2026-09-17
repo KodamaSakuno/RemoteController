@@ -138,9 +138,14 @@ public partial class MainWindow : Window
 
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
-                // 窗口按帧尺寸初始化；拉伸保持 XAML 的 Uniform（保比例，用户缩放窗口时不变形）
-                Width = hello.Width;
-                Height = hello.Height + 60;
+                // 初始尺寸按帧宽高比适配屏幕工作区；超出屏幕会被系统钳制导致 Uniform 出现黑边
+                const double chrome = 60; // 地址栏 + 标题栏余量
+                var area = (Screens.ScreenFromWindow(this)?.WorkingArea).GetValueOrDefault();
+                var scale = area.Width > 0
+                    ? Math.Min(1.0, Math.Min(area.Width / (double)hello.Width, area.Height / (double)(hello.Height + chrome)))
+                    : 1.0;
+                Width = hello.Width * scale;
+                Height = (hello.Height + chrome) * scale;
                 StatusText.Text = $"已连接 {hello.Width}x{hello.Height} @{hello.Dpi}dpi";
             });
 
