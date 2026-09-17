@@ -14,7 +14,8 @@ internal sealed class RemoteSession(WebSocket socket, ScreenCapture capture)
     {
         await SendHelloAsync();
 
-        var push = PushFramesAsync();
+        using var encoder = new FrameEncoder();
+        var push = PushFramesAsync(encoder);
         var pull = DrainClientAsync();
         await Task.WhenAny(push, pull);
 
@@ -30,11 +31,11 @@ internal sealed class RemoteSession(WebSocket socket, ScreenCapture capture)
         await socket.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
     }
 
-    private async Task PushFramesAsync()
+    private async Task PushFramesAsync(FrameEncoder encoder)
     {
         var payloadLength = capture.Width * capture.Height * 4;
         var payload = new byte[payloadLength];
-        var packet = new byte[FrameHeader.Size + payloadLength];
+        var headerPacket = new byte[FrameHeader.Size];
         using var timer = new PeriodicTimer(FrameInterval);
         Task? pending = null;
 
@@ -42,13 +43,14 @@ internal sealed class RemoteSession(WebSocket socket, ScreenCapture capture)
         {
             while (socket.State == WebSocketState.Open && await timer.WaitForNextTickAsync())
             {
-                var length = capture.Capture(payload);
                 if (pending is { IsCompleted: false })
-                    continue; // 网络积压时丢帧保实时性
+                    continue; // 网络积压时丢帧保实时性；也保证 encoder 缓冲不被未完成的发送读取
 
-                new FrameHeader(capture.Width, capture.Height, length).WriteTo(packet);
-                payload.AsSpan(0, length).CopyTo(packet.AsSpan(FrameHeader.Size));
-                pending = socket.SendAsync(packet, WebSocketMessageType.Binary, endOfMessage: true, CancellationToken.None);
+                var length = capture.Capture(payload);
+                encoder.Encode(payload, capture.Width, capture.Height);
+
+                new FrameHeader(capture.Width, capture.Height, encoder.Length).WriteTo(headerPacket);
+                pending = SendFrameAsync(headerPacket, encoder.Buffer, encoder.Length);
             }
         }
         finally
@@ -56,6 +58,13 @@ internal sealed class RemoteSession(WebSocket socket, ScreenCapture capture)
             if (pending is not null)
                 await Observe(pending);
         }
+    }
+
+    // 头与负载分两次发送（endOfMessage 仅最后一次为 true），WS 层仍视为一条消息，省一次整帧拷贝
+    private async Task SendFrameAsync(byte[] header, byte[] payload, int payloadLength)
+    {
+        await socket.SendAsync(header, WebSocketMessageType.Binary, endOfMessage: false, CancellationToken.None);
+        await socket.SendAsync(new Memory<byte>(payload, 0, payloadLength), WebSocketMessageType.Binary, endOfMessage: true, CancellationToken.None);
     }
 
     private async Task DrainClientAsync()
