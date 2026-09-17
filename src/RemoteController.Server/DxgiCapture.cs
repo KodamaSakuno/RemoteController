@@ -26,10 +26,13 @@ internal sealed unsafe class DxgiCapture : IDisposable
     {
         using var factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
         factory.EnumAdapters(0, out var adapter).CheckError();
+        ArgumentNullException.ThrowIfNull(adapter);
 
+        // 指定 adapter 时 DriverType 必须为 Unknown（D3D11 规范），Hardware 仅限无 adapter 的重载
         D3D11.D3D11CreateDevice(
-            adapter, DriverType.Hardware, DeviceCreationFlags.BgraSupport,
-            new[] { FeatureLevel.Level_11_0 }, out _device).CheckError();
+            adapter, DriverType.Unknown, DeviceCreationFlags.BgraSupport,
+            new[] { FeatureLevel.Level_11_0 }, out var device).CheckError();
+        _device = device ?? throw new InvalidOperationException("D3D11CreateDevice 未返回设备");
 
         adapter.EnumOutputs(0, out var output).CheckError();
         using (output)
@@ -88,6 +91,7 @@ internal sealed unsafe class DxgiCapture : IDisposable
             // AccumulatedFrames 为 0 表示仅指针移动无桌面变化；桌面帧仍须 ReleaseFrame
             if (info.AccumulatedFrames == 0)
                 return false;
+            ArgumentNullException.ThrowIfNull(resource);
 
             using var texture = resource.QueryInterface<ID3D11Texture2D>();
             var context = _device.ImmediateContext;
@@ -114,7 +118,7 @@ internal sealed unsafe class DxgiCapture : IDisposable
         }
         finally
         {
-            resource.Dispose();
+            resource?.Dispose();
             _duplication.ReleaseFrame();
         }
     }
