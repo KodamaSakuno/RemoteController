@@ -65,3 +65,12 @@ dotnet test RemoteController.slnx    # 全部通过
 - 公共 API 或架构决策变更时，在 `docs/` 留下说明（推荐 ADR 格式）。
 - 不提交密钥、连接串、用户私有配置；此类内容只进 `.env` 类被 `.gitignore` 覆盖的文件。
 - 改动使本文件任何描述失效时，同步更新本文件。
+
+## 6. 局域网开发回路
+
+平板（被控端）通过网络共享直接访问本仓库，在平板侧运行 Server；PC 侧与平板侧各有一个 Agent，通过共享仓库互通信息。
+
+- 平板侧运行：`dotnet run --project src/RemoteController.Server`（ARM64 首次构建慢属正常）。
+- **Server 必须监听 `http://0.0.0.0:<port>`**，禁止只绑 localhost，否则控制端无法连通。
+- 双机 Agent 的跨机信息（运行结果、报错、环境差异）写入 `docs/dev-log.md`，写完后由另一机 Agent 读取并续写，不在聊天记忆里假设对方知道。
+- 避免双机对同一项目并发执行 dotnet 命令——共享盘上 `obj/`/`bin/` 会锁竞争；需要并行时先协商分工。
