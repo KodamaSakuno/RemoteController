@@ -21,8 +21,6 @@ public partial class MainWindow : Window
 {
     private ClientWebSocket? _socket;
     private WriteableBitmap? _bitmap;
-    private WriteableBitmap? _prevBitmap; // 渲染管线可能仍持有上一帧，延迟一帧再释放
-    private byte[]? _framePayload;        // 根住位图包装的原生指针背后的数组
     private Size _serverSize;
     private int _frameCount;
 
@@ -197,23 +195,32 @@ public partial class MainWindow : Window
         _frameCount++;
         StatusText.Text = $"帧 #{_frameCount}";
 
-        // Avalonia 12 的 WriteableBitmap 原地写入不会使已上传纹理失效，
-        // 每帧新建位图才能保证刷新；每帧 16MB 的分配开销随 M2 帧编码一并消除
-        fixed (byte* ptr = payload)
+        if (_bitmap is null || _bitmap.PixelSize.Width != header.Width || _bitmap.PixelSize.Height != header.Height)
         {
-            _prevBitmap?.Dispose();
-            _prevBitmap = _bitmap;
+            _bitmap?.Dispose();
             _bitmap = new WriteableBitmap(
-                PixelFormat.Bgra8888,
-                AlphaFormat.Opaque,
-                (IntPtr)ptr,
                 new PixelSize(header.Width, header.Height),
                 new Vector(96, 96),
-                header.Width * 4);
+                PixelFormat.Bgra8888,
+                AlphaFormat.Opaque);
             FrameImage.Source = _bitmap;
         }
 
-        // 位图仅持有原始指针，必须额外根住负载数组防止 GC 回收
-        _framePayload = payload;
+        // DIB 段无行对齐填充（宽度*4 恒为 4 的倍数），但位图行距仍按实际 RowBytes 逐行拷贝
+        using (var framebuffer = _bitmap.Lock())
+        {
+            var rowBytes = header.Width * 4;
+            fixed (byte* src = payload)
+            {
+                for (var y = 0; y < header.Height; y++)
+                {
+                    var dst = (byte*)framebuffer.Address.ToPointer() + y * framebuffer.RowBytes;
+                    Buffer.MemoryCopy(src + y * rowBytes, dst, framebuffer.RowBytes, rowBytes);
+                }
+            }
+        }
+
+        // 原地写入不会使已上传纹理失效，显式触发重绘
+        FrameImage.InvalidateVisual();
     }
 }

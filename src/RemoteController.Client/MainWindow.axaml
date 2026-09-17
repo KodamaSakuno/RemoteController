@@ -8,7 +8,7 @@
         Width="800" Height="480">
     <Grid RowDefinitions="Auto,*">
         <StackPanel Orientation="Horizontal" Spacing="8" Margin="8">
-            <TextBox x:Name="HostBox" Width="220" Watermark="平板 IP，如 192.168.1.10" />
+            <TextBox x:Name="HostBox" Width="220" PlaceholderText="平板 IP，如 192.168.1.10" />
             <Button x:Name="ConnectButton" Content="连接" Click="OnConnectClicked" />
             <TextBlock x:Name="StatusText" VerticalAlignment="Center" />
         </StackPanel>
