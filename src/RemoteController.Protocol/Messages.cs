@@ -2,8 +2,8 @@ using System.Text.Json.Serialization;
 
 namespace RemoteController.Protocol;
 
-/// <summary>Server→Client 的首条控制消息：虚拟屏幕尺寸与 DPI，Client 据此建窗口与坐标映射。</summary>
-public sealed record Hello(int Width, int Height, int Dpi);
+/// <summary>Server→Client 的首条控制消息：采集区域（相对虚拟屏幕原点的偏移与尺寸）与 DPI，Client 据此建窗口与坐标映射。</summary>
+public sealed record Hello(int X, int Y, int Width, int Height, int Dpi);
 
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "kind")]
 [JsonDerivedType(typeof(MouseMove), "move")]
