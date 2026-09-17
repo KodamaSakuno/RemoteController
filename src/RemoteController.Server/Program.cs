@@ -29,8 +29,8 @@ builder.WebHost.UseUrls("http://0.0.0.0:5080");
 var app = builder.Build();
 app.UseWebSockets();
 
-// 单一采集实例供当前唯一客户端复用，避免每连接重复创建 DIB section
-using var capture = new ScreenCapture(region);
+// 单一采集实例供当前唯一客户端复用，避免每连接重复建 D3D 资源
+using var capture = new DxgiCapture(region);
 
 app.Map("/ws", async context =>
 {

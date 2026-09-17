@@ -3,13 +3,3 @@ SetProcessDpiAwarenessContext
 GetDpiForSystem
 GetSystemMetrics
 GetSystemMetricsForDpi
-GetDC
-ReleaseDC
-CreateCompatibleDC
-CreateCompatibleBitmap
-CreateDIBSection
-SelectObject
-BitBlt
-GetDIBits
-DeleteDC
-DeleteObject

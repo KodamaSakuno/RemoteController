@@ -6,9 +6,9 @@ using Windows.Win32;
 
 namespace RemoteController.Server;
 
-internal sealed class RemoteSession(WebSocket socket, ScreenCapture capture)
+internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture)
 {
-    private static readonly TimeSpan FrameInterval = TimeSpan.FromMilliseconds(66); // ≈15fps，平板 CPU 的安全起点
+    private static readonly TimeSpan MinFrameInterval = TimeSpan.FromMilliseconds(33); // 上限 30fps，duplication 变化可能更频繁
 
     public async Task RunAsync()
     {
@@ -36,20 +36,25 @@ internal sealed class RemoteSession(WebSocket socket, ScreenCapture capture)
         var payloadLength = capture.Width * capture.Height * 4;
         var payload = new byte[payloadLength];
         var headerPacket = new byte[FrameHeader.Size];
-        using var timer = new PeriodicTimer(FrameInterval);
         Task? pending = null;
+        var lastSent = DateTime.MinValue;
 
         try
         {
-            while (socket.State == WebSocketState.Open && await timer.WaitForNextTickAsync())
+            while (socket.State == WebSocketState.Open)
             {
+                // 阻塞至屏幕更新或超时；空闲时零采集零编码零流量
+                if (!capture.TryAcquireFrame(payload, 250))
+                    continue;
                 if (pending is { IsCompleted: false })
-                    continue; // 网络积压时丢帧保实时性；也保证 encoder 缓冲不被未完成的发送读取
+                    continue; // 网络积压时丢帧；也保证 encoder 缓冲不被未完成的发送读取
+                if (DateTime.UtcNow - lastSent < MinFrameInterval)
+                    continue; // 帧率上限，超出部分丢弃（duplication 会聚合后续变化）
 
-                var length = capture.Capture(payload);
                 encoder.Encode(payload, capture.Width, capture.Height);
 
                 new FrameHeader(capture.Width, capture.Height, encoder.Length).WriteTo(headerPacket);
+                lastSent = DateTime.UtcNow;
                 pending = SendFrameAsync(headerPacket, encoder.Buffer, encoder.Length);
             }
         }
