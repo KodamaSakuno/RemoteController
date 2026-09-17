@@ -69,7 +69,14 @@ internal sealed class RemoteSession(WebSocket socket, ScreenCapture capture)
                 await socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
                 return;
             }
-            // 鼠标消息在回控里程碑接入
+
+            if (result.MessageType == WebSocketMessageType.Text && result.Count > 0)
+            {
+                var message = JsonSerializer.Deserialize<MouseMessage>(
+                    Encoding.UTF8.GetString(buffer, 0, result.Count), ProtocolJson.Options);
+                if (message is not null)
+                    MouseInjector.Inject(message);
+            }
         }
     }
 
