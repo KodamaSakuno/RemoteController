@@ -8,7 +8,7 @@ public class MessageJsonTests
     [Fact]
     public void HelloRoundTrips()
     {
-        var hello = new Hello(100, 200, 1920, 1080, 144);
+        var hello = new Hello(100, 200, 1600, 2560, 144, 270);
         var json = JsonSerializer.Serialize(hello, ProtocolJson.Options);
 
         Assert.Equal(hello, JsonSerializer.Deserialize<Hello>(json, ProtocolJson.Options));

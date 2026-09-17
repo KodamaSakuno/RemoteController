@@ -8,15 +8,18 @@ using Windows.Win32.UI.WindowsAndMessaging;
 
 namespace RemoteController.Server;
 
-/// <summary>DXGI Desktop Duplication 区域采集：变化驱动，阻塞至屏幕更新才返回新帧；空闲时零开销。</summary>
+/// <summary>
+/// DXGI Desktop Duplication 区域采集：变化驱动，阻塞至屏幕更新才返回新帧；空闲时零开销。
+/// 发出的帧为纹理方向（面板原生），旋转矫正由客户端呈现时完成。
+/// </summary>
 internal sealed unsafe class DxgiCapture : IDisposable
 {
     private readonly ID3D11Device _device;
     private readonly IDXGIOutputDuplication _duplication;
     private readonly ID3D11Texture2D _staging;
 
-    // duplication 纹理为面板原生方向（本机竖屏 1600x2560），逻辑桌面经 Rotation 旋至于上；
-    // 逻辑坐标与纹理坐标之间需按 Rotation 变换
+    // duplication 纹理为面板原生方向，逻辑桌面经 Rotation 旋至于上；
+    // 区域（逻辑坐标）到纹理源矩形的换算在此完成，客户端不再关心
     private readonly ModeRotation _rotation;
     private readonly int _bufferWidth;
     private readonly int _bufferHeight;
@@ -27,11 +30,23 @@ internal sealed unsafe class DxgiCapture : IDisposable
     private readonly int _boxLeft;
     private readonly int _boxTop;
 
+    /// <summary>采集区域（逻辑坐标系），Hello 原点的来源。</summary>
     public CaptureRegion Region { get; }
-    public int Width => Region.Width;
-    public int Height => Region.Height;
 
-    // 仅供 --dump-frame 诊断输出（旋转矫正联调），稳定后随诊断路径一并移除
+    /// <summary>帧的纹理尺寸（= staging 尺寸，90/270 时相对逻辑区域转置）。</summary>
+    public int Width => _stageWidth;
+    public int Height => _stageHeight;
+
+    /// <summary>纹理相对逻辑桌面的旋转角（度），Hello 告知客户端用于呈现。</summary>
+    internal int RotationDegrees => _rotation switch
+    {
+        ModeRotation.Rotate90 => 90,
+        ModeRotation.Rotate180 => 180,
+        ModeRotation.Rotate270 => 270,
+        _ => 0,
+    };
+
+    // 仅供 --dump-frame 诊断输出，稳定后可随诊断路径一并移除
     internal ModeRotation Rotation => _rotation;
     internal int BufferWidth => _bufferWidth;
     internal int BufferHeight => _bufferHeight;
@@ -103,7 +118,7 @@ internal sealed unsafe class DxgiCapture : IDisposable
                     _stageHeight = Region.Height;
                     break;
                 case ModeRotation.Rotate90:
-                    // 逻辑(x,y) → 纹理(y, textureH-1-x)，staging 相对逻辑帧为转置
+                    // 逻辑(x,y) → 纹理(y, textureH-1-x)，staging 相对逻辑区域为转置
                     _boxLeft = ly;
                     _boxTop = _textureHeight - lx - Region.Width;
                     _stageWidth = Region.Height;
@@ -144,15 +159,8 @@ internal sealed unsafe class DxgiCapture : IDisposable
         _staging = _device.CreateTexture2D(stagingDesc);
     }
 
-    /// <summary>等待屏幕更新并读出最新帧。返回 false 表示超时无桌面变化。</summary>
+    /// <summary>等待屏幕更新并读出最新帧（纹理方向）。返回 false 表示超时无桌面变化。</summary>
     public bool TryAcquireFrame(Span<byte> destination, int timeoutMs)
-        => TryAcquireDiagnostic(destination, [], timeoutMs);
-
-    /// <summary>
-    /// <see cref="TryAcquireFrame"/> 的诊断变体：<paramref name="raw"/> 非空时额外输出 staging 原始内容
-    /// （未按旋转重排的纹理块，供 --dump-frame 区分「源矩形取错」与「旋转映射取错」）。
-    /// </summary>
-    internal bool TryAcquireDiagnostic(Span<byte> destination, Span<byte> raw, int timeoutMs)
     {
         var result = _duplication.AcquireNextFrame((uint)timeoutMs, out var info, out var resource);
         if (result.Failure)
@@ -181,19 +189,13 @@ internal sealed unsafe class DxgiCapture : IDisposable
             var mapped = context.Map(_staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
             try
             {
-                if (!raw.IsEmpty)
+                var rowBytes = _stageWidth * 4;
+                var source = (byte*)mapped.DataPointer;
+                for (var row = 0; row < _stageHeight; row++)
                 {
-                    var mappedSource = (byte*)mapped.DataPointer;
-                    var mappedPitch = (int)mapped.RowPitch;
-                    fixed (byte* rawDst = raw)
-                    {
-                        var rawRowBytes = _stageWidth * 4;
-                        for (var row = 0; row < _stageHeight; row++)
-                            Buffer.MemoryCopy(mappedSource + row * mappedPitch, rawDst + row * rawRowBytes, rawRowBytes, rawRowBytes);
-                    }
+                    new ReadOnlySpan<byte>(source + row * (int)mapped.RowPitch, rowBytes)
+                        .CopyTo(destination.Slice(row * rowBytes, rowBytes));
                 }
-
-                CopyRotated((byte*)mapped.DataPointer, (int)mapped.RowPitch, destination);
             }
             finally
             {
@@ -206,29 +208,6 @@ internal sealed unsafe class DxgiCapture : IDisposable
         {
             resource?.Dispose();
             _duplication.ReleaseFrame();
-        }
-    }
-
-    // 逻辑帧 = staging 像素按旋转规则重排；90/270 为转置（staging 宽高互换）
-    private void CopyRotated(byte* source, int sourcePitch, Span<byte> destination)
-    {
-        fixed (byte* dst = destination)
-        {
-            for (var j = 0; j < Height; j++)
-            {
-                var row = dst + j * Width * 4;
-                for (var i = 0; i < Width; i++)
-                {
-                    var (sx, sy) = _rotation switch
-                    {
-                        ModeRotation.Rotate90 => (j, Width - 1 - i),
-                        ModeRotation.Rotate270 => (Height - 1 - j, i),
-                        ModeRotation.Rotate180 => (Width - 1 - i, Height - 1 - j),
-                        _ => (i, j),
-                    };
-                    ((uint*)row)[i] = ((uint*)(source + sy * sourcePitch))[sx];
-                }
-            }
         }
     }
 

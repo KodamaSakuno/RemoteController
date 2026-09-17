@@ -23,8 +23,7 @@ if (regionIndex >= 0)
     region = parsed;
 }
 
-// --dump-frame <path.bmp>：抓一帧直接落盘（另附 .raw.bmp 为未重排的 staging 原样），
-// 用于旋转矫正联调时查看服务端实际送出的像素，不启动 Web 服务
+// --dump-frame <path.bmp>：抓一帧直接落盘，用于 box 联调时查看服务端实际送出的像素，不启动 Web 服务
 var dumpIndex = Array.IndexOf(args, "--dump-frame");
 if (dumpIndex >= 0)
 {
@@ -36,28 +35,26 @@ if (dumpIndex >= 0)
 
     var path = args[dumpIndex + 1];
     using var dumpCapture = new DxgiCapture(region);
-    var logical = new byte[dumpCapture.Width * dumpCapture.Height * 4];
-    var raw = new byte[dumpCapture.StageWidth * dumpCapture.StageHeight * 4];
+    var frame = new byte[dumpCapture.Width * dumpCapture.Height * 4];
 
     // 屏幕可能静止（AccumulatedFrames 为 0），重试直至拿到一次桌面变化
     var acquired = false;
     for (var attempt = 0; attempt < 10 && !acquired; attempt++)
-        acquired = dumpCapture.TryAcquireDiagnostic(logical, raw, 1000);
+        acquired = dumpCapture.TryAcquireFrame(frame, 1000);
     if (!acquired)
     {
         Console.Error.WriteLine("未捕获到桌面变化帧");
         return;
     }
 
-    FrameDump.WriteBmp(path, logical, dumpCapture.Width, dumpCapture.Height);
-    FrameDump.WriteBmp(path + ".raw.bmp", raw, dumpCapture.StageWidth, dumpCapture.StageHeight);
+    FrameDump.WriteBmp(path, frame, dumpCapture.Width, dumpCapture.Height);
     Console.WriteLine(
         $"Rotation={dumpCapture.Rotation} Buffer={dumpCapture.BufferWidth}x{dumpCapture.BufferHeight} " +
         $"Texture(推导)={dumpCapture.TextureWidth}x{dumpCapture.TextureHeight} " +
         $"Texture(实测)={dumpCapture.LastTextureWidth}x{dumpCapture.LastTextureHeight} " +
         $"Box=({dumpCapture.BoxLeft},{dumpCapture.BoxTop},{dumpCapture.StageWidth},{dumpCapture.StageHeight}) " +
-        $"Region={dumpCapture.Region.X},{dumpCapture.Region.Y} {dumpCapture.Width}x{dumpCapture.Height}");
-    Console.WriteLine($"已写出 {path} 与 {path}.raw.bmp");
+        $"Region={dumpCapture.Region.X},{dumpCapture.Region.Y} {dumpCapture.Region.Width}x{dumpCapture.Region.Height}");
+    Console.WriteLine($"已写出 {path}");
     return;
 }
 

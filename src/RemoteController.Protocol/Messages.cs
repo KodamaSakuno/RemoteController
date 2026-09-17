@@ -2,8 +2,12 @@ using System.Text.Json.Serialization;
 
 namespace RemoteController.Protocol;
 
-/// <summary>Server→Client 的首条控制消息：采集区域（相对虚拟屏幕原点的偏移与尺寸）与 DPI，Client 据此建窗口与坐标映射。</summary>
-public sealed record Hello(int X, int Y, int Width, int Height, int Dpi);
+/// <summary>
+/// Server→Client 的首条控制消息。
+/// Width/Height 为帧的纹理尺寸（面板原生方向，未旋转）；Rotation 为纹理相对逻辑桌面的旋转角（0/90/180/270），
+/// 逻辑尺寸在 90/270 时为宽高互换；X/Y 为采集区域原点（逻辑坐标系），Client 据此建窗口与坐标映射。
+/// </summary>
+public sealed record Hello(int X, int Y, int Width, int Height, int Dpi, int Rotation);
 
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "kind")]
 [JsonDerivedType(typeof(MouseMove), "move")]

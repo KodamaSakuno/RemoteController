@@ -26,7 +26,11 @@ internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture)
 
     private async Task SendHelloAsync()
     {
-        var hello = new Hello(capture.Region.X, capture.Region.Y, capture.Width, capture.Height, (int)PInvoke.GetDpiForSystem());
+        var hello = new Hello(
+            capture.Region.X, capture.Region.Y,
+            capture.Width, capture.Height,
+            (int)PInvoke.GetDpiForSystem(),
+            capture.RotationDegrees);
         var json = JsonSerializer.Serialize(hello, ProtocolJson.Options);
         await socket.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
     }
