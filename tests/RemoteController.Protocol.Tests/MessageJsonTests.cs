@@ -1,0 +1,37 @@
+using System.Text.Json;
+using RemoteController.Protocol;
+
+namespace RemoteController.Protocol.Tests;
+
+public class MessageJsonTests
+{
+    [Fact]
+    public void HelloRoundTrips()
+    {
+        var hello = new Hello(2880, 1920, 144);
+        var json = JsonSerializer.Serialize(hello);
+
+        Assert.Equal(hello, JsonSerializer.Deserialize<Hello>(json));
+    }
+
+    [Theory]
+    [InlineData("left")]
+    [InlineData("right")]
+    [InlineData("middle")]
+    public void MouseButtonDiscriminatorRoundTrips(string button)
+    {
+        var message = new MouseButton(Enum.Parse<MouseButtonKind>(button, ignoreCase: true), IsDown: true);
+        var json = JsonSerializer.Serialize<MouseMessage>(message);
+
+        Assert.Equal(message, JsonSerializer.Deserialize<MouseMessage>(json));
+    }
+
+    [Fact]
+    public void MouseMoveRoundTrips()
+    {
+        MouseMessage message = new MouseMove(100, 200);
+        var json = JsonSerializer.Serialize(message);
+
+        Assert.Equal(message, JsonSerializer.Deserialize<MouseMessage>(json));
+    }
+}
