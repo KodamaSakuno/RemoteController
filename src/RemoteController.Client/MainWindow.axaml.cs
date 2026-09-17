@@ -44,11 +44,7 @@ public partial class MainWindow : Window
     private void OnPointerMoved(object? sender, PointerEventArgs e)
     {
         if (TryMapToServer(e, out var x, out var y))
-        {
             Send(new MouseMove(x, y));
-            // 临时：映射联调回显，鼠标转发验收后移除
-            StatusText.Text = $"帧 #{_frameCount} → {x},{y}";
-        }
     }
 
     private void OnPointerButton(object? sender, PointerEventArgs e)
