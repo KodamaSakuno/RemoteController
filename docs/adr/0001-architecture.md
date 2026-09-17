@@ -32,7 +32,13 @@ Server 侧用 Kestrel（`FrameworkReference=Microsoft.AspNetCore.App`）承载 W
 
 理由：零第三方 NuGet 依赖、ARM64 兼容、实现快。
 
-升级路径：DXGI Output Duplication（需引入 `Vortice.Direct3D11`），可显著降低 CPU 占用并支持差帧/脏矩形，作为 M2 优化项。
+升级路径：DXGI Output Duplication（需引入 `Vortice.Direct3D11`），可显著降低 CPU 占用并支持差帧/脏矩形。若 M2 的 JPEG 编码后 CPU 仍吃紧，再评估此项。
+
+### 帧编码（M2 已落地）：JPEG via System.Drawing.Common
+
+Server 端将 BGRA 帧编码为 JPEG（quality 75）后推流，Client 用 Avalonia `Bitmap(Stream)`（Skia）解码。带宽从 ~240MB/s 降至 ~5MB/s 量级。
+
+理由：Server 为 Windows 专属进程，System.Drawing.Common 的 Windows 限制无影响；GDI+ 编码为原生速度，代码量小。
 
 ### Win32 互操作：CsWin32
 
@@ -54,6 +60,7 @@ Server 端的 Win32 API（SendInput、BitBlt、DPI 函数等）通过 `Microsoft
 
 ## 里程碑
 
-- M1：端到端最小链路（推帧、显示、鼠标回控）
-- M2：帧编码优化（JPEG/差帧/DXGI）
+- M1：端到端最小链路（推帧、显示、鼠标回控）✅
+- M1.1：区域收窄（`--region` 参数）✅
+- M2：帧编码优化（JPEG，System.Drawing.Common）✅
 - M3：平板自启动/服务化、连接配置
