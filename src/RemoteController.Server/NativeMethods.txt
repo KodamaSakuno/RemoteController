@@ -1,0 +1,13 @@
+SendInput
+SetProcessDpiAwarenessContext
+GetDpiForSystem
+GetSystemMetrics
+GetSystemMetricsForDpi
+CreateDC
+CreateCompatibleDC
+CreateCompatibleBitmap
+SelectObject
+BitBlt
+GetDIBits
+DeleteDC
+DeleteObject
