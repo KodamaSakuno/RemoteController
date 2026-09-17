@@ -9,6 +9,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Threading;
 using RemoteController.Protocol;
@@ -21,7 +22,8 @@ public partial class MainWindow : Window
     private ClientWebSocket? _socket;
     private Bitmap? _bitmap;
     private Bitmap? _prevBitmap; // 渲染管线可能仍持有上一帧，延迟一帧再释放
-    private Size _serverSize;
+    private Size _textureSize;   // 帧的纹理尺寸（hello.Width/Height，未旋转）
+    private int _rotation;       // 纹理相对逻辑桌面的旋转角（0/90/180/270）
     private int _regionOriginX;
     private int _regionOriginY;
     private int _frameCount;
@@ -70,26 +72,39 @@ public partial class MainWindow : Window
     private bool TryMapToServer(PointerEventArgs e, out int x, out int y)
     {
         x = y = 0;
-        if (_serverSize is { Width: <= 0 } or { Height: <= 0 })
+        if (_textureSize is { Width: <= 0 } or { Height: <= 0 })
             return false;
 
-        var position = e.GetPosition(FrameImage);
+        // Bounds 是纹理方向的布局矩形；视觉经 RenderTransform 旋转，指针需反向旋回
         var bounds = FrameImage.Bounds;
         if (bounds.Width <= 0 || bounds.Height <= 0)
             return false;
 
-        // Uniform 拉伸下图像在控制区内居中且保比例，先扣掉信箱黑边得到归一化坐标
-        var scale = Math.Min(bounds.Width / _serverSize.Width, bounds.Height / _serverSize.Height);
-        var renderedWidth = _serverSize.Width * scale;
-        var renderedHeight = _serverSize.Height * scale;
-        var u = (position.X - (bounds.Width - renderedWidth) / 2) / renderedWidth;
-        var v = (position.Y - (bounds.Height - renderedHeight) / 2) / renderedHeight;
+        var position = e.GetPosition(FrameImage);
+        var radians = -_rotation * Math.PI / 180;
+        var cos = Math.Cos(radians);
+        var sin = Math.Sin(radians);
+        var dx = position.X - bounds.Width / 2;
+        var dy = position.Y - bounds.Height / 2;
+        var u = (dx * cos - dy * sin) / bounds.Width + 0.5;
+        var v = (dx * sin + dy * cos) / bounds.Height + 0.5;
         if (u is < 0 or > 1 || v is < 0 or > 1)
-            return false; // 落在信箱黑边内，不产生注入
+            return false; // 落在旋转后视觉的黑区，不产生注入
 
-        // 归一化坐标 × 帧尺寸 + 区域原点 = 虚拟屏幕绝对物理像素
-        x = _regionOriginX + (int)(u * _serverSize.Width);
-        y = _regionOriginY + (int)(v * _serverSize.Height);
+        // 纹理 → 逻辑（与服务端 logical→texture 公式互逆）
+        var tw = (int)(u * _textureSize.Width);
+        var th = (int)(v * _textureSize.Height);
+        var (lx, ly) = _rotation switch
+        {
+            90 => (_textureSize.Height - 1 - th, tw),
+            270 => (th, _textureSize.Width - 1 - tw),
+            180 => (_textureSize.Width - 1 - tw, _textureSize.Height - 1 - th),
+            _ => (tw, th),
+        };
+
+        // 逻辑像素 + 区域原点 = 虚拟屏幕绝对物理像素
+        x = _regionOriginX + (int)lx;
+        y = _regionOriginY + (int)ly;
         return true;
     }
 
@@ -132,21 +147,34 @@ public partial class MainWindow : Window
             var hello = JsonSerializer.Deserialize<Hello>(
                 await ReceiveTextAsync(socket), ProtocolJson.Options)
                 ?? throw new InvalidDataException("Hello 解析失败");
-            _serverSize = new Size(hello.Width, hello.Height);
+            _textureSize = new Size(hello.Width, hello.Height);
+            _rotation = hello.Rotation;
             _regionOriginX = hello.X;
             _regionOriginY = hello.Y;
 
+            // 逻辑尺寸 = 纹理尺寸按旋转还原（90/270 宽高互换），窗口按逻辑宽高比适配屏幕
+            var rotated = _rotation is 90 or 270;
+            var logicalWidth = rotated ? hello.Height : hello.Width;
+            var logicalHeight = rotated ? hello.Width : hello.Height;
+
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
-                // 初始尺寸按帧宽高比适配屏幕工作区；超出屏幕会被系统钳制导致 Uniform 出现黑边
+                // 初始尺寸按逻辑宽高比适配屏幕工作区；超出屏幕会被系统钳制产生黑边
                 const double chrome = 60; // 地址栏 + 标题栏余量
                 var area = (Screens.ScreenFromWindow(this)?.WorkingArea).GetValueOrDefault();
                 var scale = area.Width > 0
-                    ? Math.Min(1.0, Math.Min(area.Width / (double)hello.Width, area.Height / (double)(hello.Height + chrome)))
+                    ? Math.Min(1.0, Math.Min(area.Width / (double)logicalWidth, area.Height / (double)(logicalHeight + chrome)))
                     : 1.0;
-                Width = hello.Width * scale;
-                Height = (hello.Height + chrome) * scale;
-                StatusText.Text = $"已连接 {hello.Width}x{hello.Height} @{hello.Dpi}dpi";
+                Width = logicalWidth * scale;
+                Height = (logicalHeight + chrome) * scale;
+
+                // 图像控件按纹理尺寸设定（位图同向，无变形），旋转交给 RenderTransform
+                FrameImage.Width = hello.Width * scale;
+                FrameImage.Height = hello.Height * scale;
+                FrameImage.RenderTransform = new RotateTransform(_rotation);
+                FrameImage.RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative);
+
+                StatusText.Text = $"已连接 {logicalWidth}x{logicalHeight} @{hello.Dpi}dpi (旋转 {_rotation}°)";
             });
 
             var headerBuffer = new byte[FrameHeader.Size];
