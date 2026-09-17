@@ -4,6 +4,14 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
         x:Class="RemoteController.Client.MainWindow"
-        Title="RemoteController.Client">
-    Welcome to Avalonia!
+        Title="RemoteController"
+        Width="800" Height="480">
+    <Grid RowDefinitions="Auto,*">
+        <StackPanel Orientation="Horizontal" Spacing="8" Margin="8">
+            <TextBox x:Name="HostBox" Width="220" Watermark="平板 IP，如 192.168.1.10" />
+            <Button x:Name="ConnectButton" Content="连接" Click="OnConnectClicked" />
+            <TextBlock x:Name="StatusText" VerticalAlignment="Center" />
+        </StackPanel>
+        <Image x:Name="FrameImage" Grid.Row="1" Stretch="Uniform" />
+    </Grid>
 </Window>
