@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using RemoteController.Protocol;
 using RemoteController.Server;
 using Windows.Win32;
 using Windows.Win32.UI.HiDpi;
@@ -9,6 +10,19 @@ using Windows.Win32.UI.HiDpi;
 // PER_MONITOR_AWARE_V2 无生成常量，按 Win32 定义直接取句柄值 (HANDLE)-4
 PInvoke.SetProcessDpiAwarenessContext(new DPI_AWARENESS_CONTEXT(new IntPtr(-4)));
 
+// --region x,y,w,h 指定采集区域（物理像素，相对虚拟屏幕原点）；缺省为整个虚拟屏幕
+CaptureRegion? region = null;
+var regionIndex = Array.IndexOf(args, "--region");
+if (regionIndex >= 0)
+{
+    if (regionIndex + 1 >= args.Length || !CaptureRegion.TryParse(args[regionIndex + 1], out var parsed))
+    {
+        Console.Error.WriteLine("用法: --region x,y,w,h（物理像素，相对虚拟屏幕原点）");
+        return;
+    }
+    region = parsed;
+}
+
 var builder = WebApplication.CreateBuilder(args);
 builder.WebHost.UseUrls("http://0.0.0.0:5080");
 
@@ -16,7 +30,7 @@ var app = builder.Build();
 app.UseWebSockets();
 
 // 单一采集实例供当前唯一客户端复用，避免每连接重复创建 DIB section
-using var capture = new ScreenCapture();
+using var capture = new ScreenCapture(region);
 
 app.Map("/ws", async context =>
 {

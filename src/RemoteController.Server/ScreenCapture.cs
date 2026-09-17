@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using RemoteController.Protocol;
 using Windows.Win32;
 using Windows.Win32.Foundation;
 using Windows.Win32.Graphics.Gdi;
@@ -7,7 +8,7 @@ using Windows.Win32.UI.WindowsAndMessaging;
 
 namespace RemoteController.Server;
 
-/// <summary>GDI 全屏采集：一次性创建 DIB section，逐帧 BitBlt 后直接读位图内存。</summary>
+/// <summary>GDI 区域采集：一次性创建 DIB section，逐帧 BitBlt 后直接读位图内存。</summary>
 internal sealed unsafe class ScreenCapture : IDisposable
 {
     private readonly HWND _screenHwnd;
@@ -17,17 +18,28 @@ internal sealed unsafe class ScreenCapture : IDisposable
     private readonly HGDIOBJ _oldBitmap;
     private readonly byte* _bits;
 
-    public int Width { get; }
-    public int Height { get; }
-    private readonly int _originX;
-    private readonly int _originY;
+    public CaptureRegion Region { get; }
+    public int Width => Region.Width;
+    public int Height => Region.Height;
+    private readonly int _sourceX;
+    private readonly int _sourceY;
 
-    public ScreenCapture()
+    /// <param name="region">采集区域；null 表示整个虚拟屏幕。坐标相对虚拟屏幕左上角，越界即抛异常。</param>
+    public ScreenCapture(CaptureRegion? region)
     {
-        _originX = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_XVIRTUALSCREEN);
-        _originY = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_YVIRTUALSCREEN);
-        Width = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CXVIRTUALSCREEN);
-        Height = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CYVIRTUALSCREEN);
+        var virtualX = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_XVIRTUALSCREEN);
+        var virtualY = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_YVIRTUALSCREEN);
+        var virtualWidth = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CXVIRTUALSCREEN);
+        var virtualHeight = PInvoke.GetSystemMetrics(SYSTEM_METRICS_INDEX.SM_CYVIRTUALSCREEN);
+
+        Region = region ?? new CaptureRegion(0, 0, virtualWidth, virtualHeight);
+        if (Region.X < 0 || Region.Y < 0
+            || Region.X + Region.Width > virtualWidth
+            || Region.Y + Region.Height > virtualHeight)
+            throw new ArgumentOutOfRangeException(nameof(region), "采集区域超出虚拟屏幕范围");
+
+        _sourceX = virtualX + Region.X;
+        _sourceY = virtualY + Region.Y;
 
         // GetDC(NULL) 返回覆盖整个虚拟屏幕的 DC，多显示器坐标系一致
         _screenHwnd = new HWND(IntPtr.Zero);
@@ -59,7 +71,7 @@ internal sealed unsafe class ScreenCapture : IDisposable
     public int Capture(Span<byte> destination)
     {
         // BitBlt 不设置 LastError，失败只能按返回值判断
-        if (!PInvoke.BitBlt(_memoryDc, 0, 0, Width, Height, _screenDc, _originX, _originY, ROP_CODE.SRCCOPY))
+        if (!PInvoke.BitBlt(_memoryDc, 0, 0, Width, Height, _screenDc, _sourceX, _sourceY, ROP_CODE.SRCCOPY))
             throw new Win32Exception("BitBlt 失败");
 
         var length = Width * Height * 4;
