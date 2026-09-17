@@ -9,9 +9,9 @@ public class MessageJsonTests
     public void HelloRoundTrips()
     {
         var hello = new Hello(2880, 1920, 144);
-        var json = JsonSerializer.Serialize(hello);
+        var json = JsonSerializer.Serialize(hello, ProtocolJson.Options);
 
-        Assert.Equal(hello, JsonSerializer.Deserialize<Hello>(json));
+        Assert.Equal(hello, JsonSerializer.Deserialize<Hello>(json, ProtocolJson.Options));
     }
 
     [Theory]
@@ -21,17 +21,17 @@ public class MessageJsonTests
     public void MouseButtonDiscriminatorRoundTrips(string button)
     {
         var message = new MouseButton(Enum.Parse<MouseButtonKind>(button, ignoreCase: true), IsDown: true);
-        var json = JsonSerializer.Serialize<MouseMessage>(message);
+        var json = JsonSerializer.Serialize<MouseMessage>(message, ProtocolJson.Options);
 
-        Assert.Equal(message, JsonSerializer.Deserialize<MouseMessage>(json));
+        Assert.Equal(message, JsonSerializer.Deserialize<MouseMessage>(json, ProtocolJson.Options));
     }
 
     [Fact]
     public void MouseMoveRoundTrips()
     {
         MouseMessage message = new MouseMove(100, 200);
-        var json = JsonSerializer.Serialize(message);
+        var json = JsonSerializer.Serialize(message, ProtocolJson.Options);
 
-        Assert.Equal(message, JsonSerializer.Deserialize<MouseMessage>(json));
+        Assert.Equal(message, JsonSerializer.Deserialize<MouseMessage>(json, ProtocolJson.Options));
     }
 }
