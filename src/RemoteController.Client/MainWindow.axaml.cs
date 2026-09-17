@@ -20,6 +20,8 @@ namespace RemoteController.Client;
 public partial class MainWindow : Window
 {
     private ClientWebSocket? _socket;
+    private bool _connecting;      // 连接循环运行中（含重连等待）
+    private bool _manualDisconnect; // 用户点「断开」后置位，终止重连循环
     private Bitmap? _bitmap;
     private Bitmap? _prevBitmap; // 渲染管线可能仍持有上一帧，延迟一帧再释放
     private Size _textureSize;   // 帧的纹理尺寸（hello.Width/Height，未旋转）
@@ -117,90 +119,116 @@ public partial class MainWindow : Window
 
     private async void OnConnectClicked(object? sender, RoutedEventArgs e)
     {
-        if (_socket is not null)
+        if (_connecting)
+        {
+            // 连接中或重连等待中：视为停止请求
+            _manualDisconnect = true;
+            _socket?.Abort();
             return;
+        }
 
-        _socket = new ClientWebSocket();
+        _manualDisconnect = false;
+        var host = HostBox.Text?.Trim() ?? string.Empty;
+        ConnectButton.Content = "断开";
+        _connecting = true;
         try
         {
-            var host = HostBox.Text?.Trim() ?? string.Empty;
-            await _socket.ConnectAsync(new Uri($"ws://{host}:5080/ws"), CancellationToken.None);
-            StatusText.Text = "已连接";
-            new ClientSettings(host).Save();
-            _ = ReceiveLoopAsync(_socket);
+            await ConnectLoopAsync(host);
         }
-        catch (Exception ex)
+        finally
         {
-            StatusText.Text = $"连接失败: {ex.Message}";
-            _socket.Dispose();
-            _socket = null;
+            _connecting = false;
+            ConnectButton.Content = "连接";
         }
+    }
+
+    // 连接 → 运行 → 断开 → 退避重连，直到用户点「断开」
+    private async Task ConnectLoopAsync(string host)
+    {
+        var attempt = 0;
+        while (!_manualDisconnect)
+        {
+            var uri = host.Contains(':') ? $"ws://{host}/ws" : $"ws://{host}:5080/ws";
+            _socket = new ClientWebSocket();
+            try
+            {
+                await _socket.ConnectAsync(new Uri(uri), CancellationToken.None);
+                attempt = 0;
+                new ClientSettings(host).Save();
+                await ReceiveLoopAsync(_socket); // 运行至断开，异常向上抛
+            }
+            catch (Exception ex) when (ex is WebSocketException or IOException or InvalidDataException or JsonException or OperationCanceledException)
+            {
+                if (!_manualDisconnect)
+                    StatusText.Text = $"连接失败: {ex.Message}";
+            }
+            finally
+            {
+                _socket.Dispose();
+                _socket = null;
+            }
+
+            if (_manualDisconnect)
+                break;
+
+            // 指数退避：2s 起，15s 封顶
+            var delaySeconds = Math.Min(2 << attempt, 15);
+            attempt++;
+            StatusText.Text = $"连接中断，{delaySeconds}s 后重连…";
+            await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
+        }
+
+        StatusText.Text = "已断开";
     }
 
     private async Task ReceiveLoopAsync(ClientWebSocket socket)
     {
-        try
+        // Server 保证先发送 Hello 再开始推帧
+        var hello = JsonSerializer.Deserialize<Hello>(
+            await ReceiveTextAsync(socket), ProtocolJson.Options)
+            ?? throw new InvalidDataException("Hello 解析失败");
+        _textureSize = new Size(hello.Width, hello.Height);
+        _rotation = hello.Rotation;
+        _regionOriginX = hello.X;
+        _regionOriginY = hello.Y;
+
+        // 逻辑尺寸 = 纹理尺寸按旋转还原（90/270 宽高互换），窗口按逻辑宽高比适配屏幕
+        var rotated = _rotation is 90 or 270;
+        var logicalWidth = rotated ? hello.Height : hello.Width;
+        var logicalHeight = rotated ? hello.Width : hello.Height;
+
+        await Dispatcher.UIThread.InvokeAsync(() =>
         {
-            // Server 保证先发送 Hello 再开始推帧
-            var hello = JsonSerializer.Deserialize<Hello>(
-                await ReceiveTextAsync(socket), ProtocolJson.Options)
-                ?? throw new InvalidDataException("Hello 解析失败");
-            _textureSize = new Size(hello.Width, hello.Height);
-            _rotation = hello.Rotation;
-            _regionOriginX = hello.X;
-            _regionOriginY = hello.Y;
+            // 初始尺寸按逻辑宽高比适配屏幕工作区；超出屏幕会被系统钳制产生黑边
+            const double chrome = 60; // 地址栏 + 标题栏余量
+            var area = (Screens.ScreenFromWindow(this)?.WorkingArea).GetValueOrDefault();
+            var scale = area.Width > 0
+                ? Math.Min(1.0, Math.Min(area.Width / (double)logicalWidth, area.Height / (double)(logicalHeight + chrome)))
+                : 1.0;
+            Width = logicalWidth * scale;
+            Height = (logicalHeight + chrome) * scale;
 
-            // 逻辑尺寸 = 纹理尺寸按旋转还原（90/270 宽高互换），窗口按逻辑宽高比适配屏幕
-            var rotated = _rotation is 90 or 270;
-            var logicalWidth = rotated ? hello.Height : hello.Width;
-            var logicalHeight = rotated ? hello.Width : hello.Height;
+            // 图像控件按纹理尺寸设定（位图同向，无变形），旋转交给 RenderTransform
+            FrameImage.Width = hello.Width * scale;
+            FrameImage.Height = hello.Height * scale;
+            FrameImage.RenderTransform = new RotateTransform(_rotation);
+            FrameImage.RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative);
 
-            await Dispatcher.UIThread.InvokeAsync(() =>
-            {
-                // 初始尺寸按逻辑宽高比适配屏幕工作区；超出屏幕会被系统钳制产生黑边
-                const double chrome = 60; // 地址栏 + 标题栏余量
-                var area = (Screens.ScreenFromWindow(this)?.WorkingArea).GetValueOrDefault();
-                var scale = area.Width > 0
-                    ? Math.Min(1.0, Math.Min(area.Width / (double)logicalWidth, area.Height / (double)(logicalHeight + chrome)))
-                    : 1.0;
-                Width = logicalWidth * scale;
-                Height = (logicalHeight + chrome) * scale;
+            StatusText.Text = $"已连接 {logicalWidth}x{logicalHeight} @{hello.Dpi}dpi (旋转 {_rotation}°)";
+        });
 
-                // 图像控件按纹理尺寸设定（位图同向，无变形），旋转交给 RenderTransform
-                FrameImage.Width = hello.Width * scale;
-                FrameImage.Height = hello.Height * scale;
-                FrameImage.RenderTransform = new RotateTransform(_rotation);
-                FrameImage.RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative);
-
-                StatusText.Text = $"已连接 {logicalWidth}x{logicalHeight} @{hello.Dpi}dpi (旋转 {_rotation}°)";
-            });
-
-            var headerBuffer = new byte[FrameHeader.Size];
-            while (socket.State == WebSocketState.Open)
-            {
-                // WS 不保证一次 Receive 对应一个完整消息，头部与负载分别读满
-                await ReadExactAsync(socket, headerBuffer);
-                if (!FrameHeader.TryParse(headerBuffer, out var header))
-                    throw new InvalidDataException("帧头解析失败");
-
-                var payload = new byte[header.PayloadLength];
-                await ReadExactAsync(socket, payload);
-
-                await Dispatcher.UIThread.InvokeAsync(() => HandleFrame(header, payload));
-            }
-        }
-        catch (Exception ex) when (ex is WebSocketException or IOException or OperationCanceledException or InvalidDataException)
+        var headerBuffer = new byte[FrameHeader.Size];
+        while (socket.State == WebSocketState.Open)
         {
-            await Dispatcher.UIThread.InvokeAsync(() => StatusText.Text = $"连接中断: {ex.Message}");
-        }
-        finally
-        {
-            socket.Dispose();
-            await Dispatcher.UIThread.InvokeAsync(() =>
-            {
-                if (ReferenceEquals(_socket, socket))
-                    _socket = null;
-            });
+            // WS 不保证一次 Receive 对应一个完整消息，头部与负载分别读满
+            await ReadExactAsync(socket, headerBuffer);
+            if (!FrameHeader.TryParse(headerBuffer, out var header))
+                throw new InvalidDataException("帧头解析失败");
+
+            var payload = new byte[header.PayloadLength];
+            await ReadExactAsync(socket, payload);
+
+            await Dispatcher.UIThread.InvokeAsync(() => HandleFrame(header, payload));
         }
     }
 
