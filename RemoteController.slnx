@@ -1,2 +1,10 @@
 <Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RemoteController.Client/RemoteController.Client.csproj" />
+    <Project Path="src/RemoteController.Protocol/RemoteController.Protocol.csproj" />
+    <Project Path="src/RemoteController.Server/RemoteController.Server.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RemoteController.Protocol.Tests/RemoteController.Protocol.Tests.csproj" />
+  </Folder>
 </Solution>
