@@ -26,13 +26,13 @@ Server 侧用 Kestrel（`FrameworkReference=Microsoft.AspNetCore.App`）承载 W
 - 浏览器原生支持 WebSocket，未来控制端可扩展为网页/手机端（对本项目场景有实际价值）
 - 局域网带宽足够，暂不需要更底层的传输优化
 
-### 画面采集 v1：GDI BitBlt
+### 画面采集：DXGI Desktop Duplication（已替换 GDI BitBlt）
 
-抓全屏后裁剪到目标区域，传输原始 BGRA 帧。
+变化驱动的屏幕采集：`AcquireNextFrame` 阻塞至屏幕更新才返回，空闲时零采集、零编码、零流量。区域通过 `CopySubresourceRegion` 源矩形裁剪，CPU 回读经 staging texture。经 `Vortice.Direct3D11`（3.8.3）接入。
 
-理由：零第三方 NuGet 依赖、ARM64 兼容、实现快。
+理由：空闲零开销（挂机常态）、GPU 侧拷贝；代价是新增 Vortice 依赖与每输出一个 duplication 实例（当前仅主输出，多显示器扩展留待需求出现）。
 
-升级路径：DXGI Output Duplication（需引入 `Vortice.Direct3D11`），可显著降低 CPU 占用并支持差帧/脏矩形。若 M2 的 JPEG 编码后 CPU 仍吃紧，再评估此项。
+光标不做合成（用户明确取舍），远程指针不可见于画面，以界面响应为反馈。
 
 ### 帧编码（M2 已落地）：JPEG via System.Drawing.Common
 

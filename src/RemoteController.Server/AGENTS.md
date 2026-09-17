@@ -6,7 +6,7 @@
 
 - **一律使用 CsWin32 源生成**（`Microsoft.Windows.CsWin32`），禁止手写 `DllImport`。所需的 Win32 API 追加到 `NativeMethods.txt`，每行一个；相关结构体/常量由生成器自动带出。
 - 生成的类型位于 `Windows.Win32` 命名空间。不得把生成代码复制粘贴成手写副本。
-- M2 引入 DXGI 采集时添加 `Vortice.Direct3D11`；在此之前不引入其他第三方依赖。
+- DXGI/D3D11 通过 `Vortice.Direct3D11` 接入，禁止手写 COM vtable 互操作。
 
 ## DPI 与坐标
 
@@ -22,4 +22,6 @@
 
 ## 资源管理
 
-- GDI 对象（DC、Bitmap）严格配对释放：`DeleteDC` / `DeleteObject`，用 `SafeHandle` 封装避免泄漏；采集循环内不重复创建 DC，建立一次复用。
+- D3D 对象（device、duplication、staging texture）建立一次复用，Dispose 逆序释放。
+- `AcquireNextFrame` 成功后在 finally 中必须 `ReleaseFrame`，包括「仅指针移动、无桌面变化」（`AccumulatedFrames == 0`）的分支。
+- GDI 采集已移除，禁止重新引入 BitBlt 路径。
