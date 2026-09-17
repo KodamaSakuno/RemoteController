@@ -30,7 +30,7 @@ Server 侧用 Kestrel（`FrameworkReference=Microsoft.AspNetCore.App`）承载 W
 
 变化驱动的屏幕采集：`AcquireNextFrame` 阻塞至屏幕更新才返回，空闲时零采集、零编码、零流量。区域通过 `CopySubresourceRegion` 源矩形裁剪，CPU 回读经 staging texture。经 `Vortice.Direct3D11`（3.8.3）接入。
 
-理由：空闲零开销（挂机常态）、GPU 侧拷贝；代价是新增 Vortice 依赖与每输出一个 duplication 实例（当前仅主输出，多显示器扩展留待需求出现）。
+**旋转在客户端呈现**（2026-09-18 决策）：服务端只发送纹理方向（面板原生）的帧，Hello 携带 `Rotation`；客户端用 `RenderTransform` 旋转渲染（GPU 零成本），指针坐标逆旋转映射回逻辑空间。理由：逐像素旋转重排是每帧 16MB 的 CPU gather，迁出平板后挂机/动画场景的功耗显著下降；服务端保留的只剩区域（逻辑）→纹理源矩形的换算（box 数学），旋转呈现逻辑放在可调试的 PC 侧。
 
 光标不做合成（用户明确取舍），远程指针不可见于画面，以界面响应为反馈。
 

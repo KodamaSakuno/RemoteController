@@ -24,4 +24,5 @@
 
 - D3D 对象（device、duplication、staging texture）建立一次复用，Dispose 逆序释放。
 - `AcquireNextFrame` 成功后在 finally 中必须 `ReleaseFrame`，包括「仅指针移动、无桌面变化」（`AccumulatedFrames == 0`）的分支。
+- 帧一律发送**纹理方向**（面板原生），旋转矫正禁止在服务端做；区域（逻辑）→纹理源矩形的 box 数学是唯一保留的坐标变换。
 - GDI 采集已移除，禁止重新引入 BitBlt 路径。
