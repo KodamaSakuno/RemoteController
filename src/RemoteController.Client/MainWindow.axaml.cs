@@ -22,6 +22,8 @@ public partial class MainWindow : Window
     private ClientWebSocket? _socket;
     private WriteableBitmap? _bitmap;
     private Size _serverSize;
+    private int _regionOriginX;
+    private int _regionOriginY;
     private int _frameCount;
 
     public MainWindow()
@@ -76,9 +78,9 @@ public partial class MainWindow : Window
         if (bounds.Width <= 0 || bounds.Height <= 0)
             return false;
 
-        // Fill 拉伸下图像与控制区重合，直接按宽高比线性映射回服务器物理像素
-        x = (int)(position.X / bounds.Width * _serverSize.Width);
-        y = (int)(position.Y / bounds.Height * _serverSize.Height);
+        // Fill 拉伸下图像与控制区重合，映射回区域物理像素后加上区域原点得到虚拟屏幕绝对坐标
+        x = _regionOriginX + (int)(position.X / bounds.Width * _serverSize.Width);
+        y = _regionOriginY + (int)(position.Y / bounds.Height * _serverSize.Height);
         return true;
     }
 
@@ -122,6 +124,8 @@ public partial class MainWindow : Window
                 await ReceiveTextAsync(socket), ProtocolJson.Options)
                 ?? throw new InvalidDataException("Hello 解析失败");
             _serverSize = new Size(hello.Width, hello.Height);
+            _regionOriginX = hello.X;
+            _regionOriginY = hello.Y;
 
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
