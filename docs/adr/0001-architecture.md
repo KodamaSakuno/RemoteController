@@ -34,6 +34,10 @@ Server 侧用 Kestrel（`FrameworkReference=Microsoft.AspNetCore.App`）承载 W
 
 升级路径：DXGI Output Duplication（需引入 `Vortice.Direct3D11`），可显著降低 CPU 占用并支持差帧/脏矩形，作为 M2 优化项。
 
+### Win32 互操作：CsWin32
+
+Server 端的 Win32 API（SendInput、BitBlt、DPI 函数等）通过 `Microsoft.Windows.CsWin32` 源生成器接入，禁止手写 `DllImport`：签名直接来自 win32metadata，避免手写结构体布局错误；零运行时依赖。
+
 ### 鼠标注入：SendInput（P/Invoke）
 
 零依赖，支持移动/按下/抬起，后续可扩展滚轮。
