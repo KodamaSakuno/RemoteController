@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
 using RemoteController.Protocol;
 using RemoteController.Server;
 using Windows.Win32;
@@ -10,30 +11,23 @@ using Windows.Win32.UI.HiDpi;
 // PER_MONITOR_AWARE_V2 无生成常量，按 Win32 定义直接取句柄值 (HANDLE)-4
 PInvoke.SetProcessDpiAwarenessContext(new DPI_AWARENESS_CONTEXT(new IntPtr(-4)));
 
-// --region x,y,w,h 指定采集区域（物理像素，相对虚拟屏幕原点）；缺省为整个虚拟屏幕
+var builder = WebApplication.CreateBuilder(args);
+
+// 区域：命令行 --region 优先，其次配置 Region，缺省整屏
+var regionValue = ConfigurationValue(args, "--region") ?? builder.Configuration["Region"];
 CaptureRegion? region = null;
-var regionIndex = Array.IndexOf(args, "--region");
-if (regionIndex >= 0)
+if (regionValue is not null && !CaptureRegion.TryParse(regionValue, out region))
 {
-    if (regionIndex + 1 >= args.Length || !CaptureRegion.TryParse(args[regionIndex + 1], out var parsed))
-    {
-        Console.Error.WriteLine("用法: --region x,y,w,h（物理像素，相对虚拟屏幕原点）");
-        return;
-    }
-    region = parsed;
+    Console.Error.WriteLine("区域格式应为 x,y,w,h（物理像素，相对虚拟屏幕原点）");
+    return;
 }
 
-// --dump-frame <path.bmp>：抓一帧直接落盘，用于 box 联调时查看服务端实际送出的像素，不启动 Web 服务
-var dumpIndex = Array.IndexOf(args, "--dump-frame");
-if (dumpIndex >= 0)
-{
-    if (dumpIndex + 1 >= args.Length)
-    {
-        Console.Error.WriteLine("用法: --dump-frame <path.bmp>");
-        return;
-    }
+var quality = builder.Configuration.GetValue("Quality", 75);
 
-    var path = args[dumpIndex + 1];
+// --dump-frame <path.bmp>：抓一帧直接落盘，用于 box 联调时查看服务端实际送出的像素，不启动 Web 服务
+var dumpPath = ConfigurationValue(args, "--dump-frame");
+if (dumpPath is not null)
+{
     using var dumpCapture = new DxgiCapture(region);
     var frame = new byte[dumpCapture.Width * dumpCapture.Height * 4];
 
@@ -47,19 +41,19 @@ if (dumpIndex >= 0)
         return;
     }
 
-    FrameDump.WriteBmp(path, frame, dumpCapture.Width, dumpCapture.Height);
+    FrameDump.WriteBmp(dumpPath, frame, dumpCapture.Width, dumpCapture.Height);
     Console.WriteLine(
         $"Rotation={dumpCapture.Rotation} Buffer={dumpCapture.BufferWidth}x{dumpCapture.BufferHeight} " +
         $"Texture(推导)={dumpCapture.TextureWidth}x{dumpCapture.TextureHeight} " +
         $"Texture(实测)={dumpCapture.LastTextureWidth}x{dumpCapture.LastTextureHeight} " +
         $"Box=({dumpCapture.BoxLeft},{dumpCapture.BoxTop},{dumpCapture.StageWidth},{dumpCapture.StageHeight}) " +
         $"Region={dumpCapture.Region.X},{dumpCapture.Region.Y} {dumpCapture.Region.Width}x{dumpCapture.Region.Height}");
-    Console.WriteLine($"已写出 {path}");
+    Console.WriteLine($"已写出 {dumpPath}");
     return;
 }
 
-var builder = WebApplication.CreateBuilder(args);
-builder.WebHost.UseUrls("http://0.0.0.0:5080");
+// 监听地址由配置 Urls 决定（缺省 http://0.0.0.0:5080，见 appsettings.json）；appsettings 不自动进入宿主配置，需显式应用
+builder.WebHost.UseUrls(builder.Configuration["Urls"] ?? "http://0.0.0.0:5080");
 
 var app = builder.Build();
 app.UseWebSockets();
@@ -76,7 +70,14 @@ app.Map("/ws", async context =>
     }
 
     using var socket = await context.WebSockets.AcceptWebSocketAsync();
-    await new RemoteSession(socket, capture).RunAsync();
+    await new RemoteSession(socket, capture, quality).RunAsync();
 });
 
 app.Run();
+
+/// <summary>取命令行 key 后的一个参数；缺 key 或缺值返回 null。</summary>
+static string? ConfigurationValue(string[] args, string key)
+{
+    var index = Array.IndexOf(args, key);
+    return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
+}

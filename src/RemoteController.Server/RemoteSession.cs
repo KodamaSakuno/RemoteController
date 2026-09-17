@@ -6,7 +6,7 @@ using Windows.Win32;
 
 namespace RemoteController.Server;
 
-internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture)
+internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture, int quality)
 {
     private static readonly TimeSpan MinFrameInterval = TimeSpan.FromMilliseconds(33); // 上限 30fps，duplication 变化可能更频繁
 
@@ -14,7 +14,7 @@ internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture)
     {
         await SendHelloAsync();
 
-        using var encoder = new FrameEncoder();
+        using var encoder = new FrameEncoder(quality);
         // 先启动接收：PushFrames 是阻塞式同步循环，若先调用会占住线程导致接收循环永远没机会启动
         var pull = DrainClientAsync();
         var push = Task.Run(() => PushFrames(encoder));
