@@ -7,11 +7,13 @@ using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Media.Imaging;
 using Avalonia.Platform;
 using Avalonia.Threading;
 using RemoteController.Protocol;
+using ProtocolMouseButton = RemoteController.Protocol.MouseButton;
 
 namespace RemoteController.Client;
 
@@ -28,6 +30,65 @@ public partial class MainWindow : Window
         var args = Environment.GetCommandLineArgs();
         if (args.Length > 1)
             HostBox.Text = args[1];
+
+        FrameImage.PointerMoved += OnPointerMoved;
+        FrameImage.PointerPressed += OnPointerButton;
+        FrameImage.PointerReleased += OnPointerButton;
+    }
+
+    private void OnPointerMoved(object? sender, PointerEventArgs e)
+    {
+        if (TryMapToServer(e, out var x, out var y))
+            Send(new MouseMove(x, y));
+    }
+
+    private void OnPointerButton(object? sender, PointerEventArgs e)
+    {
+        var updateKind = e.GetCurrentPoint(FrameImage).Properties.PointerUpdateKind;
+        var kind = updateKind switch
+        {
+            PointerUpdateKind.LeftButtonPressed or PointerUpdateKind.LeftButtonReleased => MouseButtonKind.Left,
+            PointerUpdateKind.RightButtonPressed or PointerUpdateKind.RightButtonReleased => MouseButtonKind.Right,
+            PointerUpdateKind.MiddleButtonPressed or PointerUpdateKind.MiddleButtonReleased => MouseButtonKind.Middle,
+            _ => (MouseButtonKind?)null,
+        };
+        if (kind is null || !TryMapToServer(e, out _, out _))
+            return;
+
+        var isDown = updateKind.ToString().EndsWith("Pressed", StringComparison.Ordinal);
+        if (isDown)
+            e.Pointer.Capture(FrameImage); // 拖拽期间持续收到移动事件，即使指针移出图像
+        else
+            e.Pointer.Capture(null);
+
+        Send(new ProtocolMouseButton(kind.Value, isDown));
+    }
+
+    private bool TryMapToServer(PointerEventArgs e, out int x, out int y)
+    {
+        x = y = 0;
+        if (_serverSize is { Width: <= 0 } or { Height: <= 0 })
+            return false;
+
+        var position = e.GetPosition(FrameImage);
+        var bounds = FrameImage.Bounds;
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+            return false;
+
+        // Fill 拉伸下图像与控制区重合，直接按宽高比线性映射回服务器物理像素
+        x = (int)(position.X / bounds.Width * _serverSize.Width);
+        y = (int)(position.Y / bounds.Height * _serverSize.Height);
+        return true;
+    }
+
+    private void Send(MouseMessage message)
+    {
+        if (_socket?.State != WebSocketState.Open)
+            return;
+
+        var json = JsonSerializer.Serialize<MouseMessage>(message, ProtocolJson.Options);
+        _ = _socket.SendAsync(
+            Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
     }
 
     private async void OnConnectClicked(object? sender, RoutedEventArgs e)
