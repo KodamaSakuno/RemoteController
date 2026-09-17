@@ -15,8 +15,9 @@ internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture)
         await SendHelloAsync();
 
         using var encoder = new FrameEncoder();
-        var push = PushFramesAsync(encoder);
+        // 先启动接收：PushFrames 是阻塞式同步循环，若先调用会占住线程导致接收循环永远没机会启动
         var pull = DrainClientAsync();
+        var push = Task.Run(() => PushFrames(encoder));
         await Task.WhenAny(push, pull);
 
         // 一端结束后中止连接，让另一端循环退出
@@ -35,7 +36,8 @@ internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture)
         await socket.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
     }
 
-    private async Task PushFramesAsync(FrameEncoder encoder)
+    // 阻塞式同步循环，必须在独立线程运行（见 RunAsync 的启动顺序）
+    private void PushFrames(FrameEncoder encoder)
     {
         var payloadLength = capture.Width * capture.Height * 4;
         var payload = new byte[payloadLength];
@@ -64,8 +66,9 @@ internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture)
         }
         finally
         {
+            // 未 await 的发送在连接已关闭时可能抛非 WebSocket 异常，吞噬即可
             if (pending is not null)
-                await Observe(pending);
+                try { pending.Wait(); } catch { }
         }
     }
 
