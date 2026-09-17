@@ -78,9 +78,18 @@ public partial class MainWindow : Window
         if (bounds.Width <= 0 || bounds.Height <= 0)
             return false;
 
-        // Fill 拉伸下图像与控制区重合，映射回区域物理像素后加上区域原点得到虚拟屏幕绝对坐标
-        x = _regionOriginX + (int)(position.X / bounds.Width * _serverSize.Width);
-        y = _regionOriginY + (int)(position.Y / bounds.Height * _serverSize.Height);
+        // Uniform 拉伸下图像在控制区内居中且保比例，先扣掉信箱黑边得到归一化坐标
+        var scale = Math.Min(bounds.Width / _serverSize.Width, bounds.Height / _serverSize.Height);
+        var renderedWidth = _serverSize.Width * scale;
+        var renderedHeight = _serverSize.Height * scale;
+        var u = (position.X - (bounds.Width - renderedWidth) / 2) / renderedWidth;
+        var v = (position.Y - (bounds.Height - renderedHeight) / 2) / renderedHeight;
+        if (u is < 0 or > 1 || v is < 0 or > 1)
+            return false; // 落在信箱黑边内，不产生注入
+
+        // 归一化坐标 × 帧尺寸 + 区域原点 = 虚拟屏幕绝对物理像素
+        x = _regionOriginX + (int)(u * _serverSize.Width);
+        y = _regionOriginY + (int)(v * _serverSize.Height);
         return true;
     }
 
@@ -129,10 +138,9 @@ public partial class MainWindow : Window
 
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
-                // 窗口按帧尺寸调整，显示用 Fill 拉伸避免信箱黑边影响坐标映射
+                // 窗口按帧尺寸初始化；拉伸保持 XAML 的 Uniform（保比例，用户缩放窗口时不变形）
                 Width = hello.Width;
                 Height = hello.Height + 60;
-                FrameImage.Stretch = Avalonia.Media.Stretch.Fill;
                 StatusText.Text = $"已连接 {hello.Width}x{hello.Height} @{hello.Dpi}dpi";
             });
 
