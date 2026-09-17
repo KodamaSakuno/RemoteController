@@ -480,3 +480,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# 双机 Agent 共享的开发日志（临时协作状态，不入库；沉淀的结论进 ADR/docs）
+docs/dev-log.md

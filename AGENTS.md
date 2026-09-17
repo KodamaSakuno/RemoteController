@@ -72,5 +72,5 @@ dotnet test RemoteController.slnx    # 全部通过
 
 - 平板侧运行：`dotnet run --project src/RemoteController.Server`（ARM64 首次构建慢属正常）。
 - **Server 必须监听 `http://0.0.0.0:<port>`**，禁止只绑 localhost，否则控制端无法连通。
-- 双机 Agent 的跨机信息（运行结果、报错、环境差异）写入 `docs/dev-log.md`，写完后由另一机 Agent 读取并续写，不在聊天记忆里假设对方知道。
+- 双机 Agent 的跨机信息写入 `docs/dev-log.md`（已被 gitignore，属临时协作状态，不入库），写完后由另一机 Agent 读取并续写，不在聊天记忆里假设对方知道；其中沉淀的结论转记到 `docs/` 正式文档。
 - 避免双机对同一项目并发执行 dotnet 命令——共享盘上 `obj/`/`bin/` 会锁竞争；需要并行时先协商分工。
