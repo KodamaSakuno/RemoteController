@@ -33,7 +33,7 @@ internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture, int q
             capture.Width, capture.Height,
             (int)PInvoke.GetDpiForSystem(),
             capture.RotationDegrees);
-        var json = JsonSerializer.Serialize(hello, ProtocolJson.Options);
+        var json = JsonSerializer.Serialize(hello, ProtocolJsonContext.Default.Hello);
         await socket.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
     }
 
@@ -94,8 +94,8 @@ internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture, int q
 
             if (result.MessageType == WebSocketMessageType.Text && result.Count > 0)
             {
-                var message = JsonSerializer.Deserialize<MouseMessage>(
-                    Encoding.UTF8.GetString(buffer, 0, result.Count), ProtocolJson.Options);
+                var message = JsonSerializer.Deserialize(
+                    Encoding.UTF8.GetString(buffer, 0, result.Count), ProtocolJsonContext.Default.MouseMessage);
                 if (message is not null)
                     MouseInjector.Inject(message);
             }

@@ -149,7 +149,7 @@ public partial class MainWindow : Window
         if (_socket?.State != WebSocketState.Open)
             return;
 
-        var json = JsonSerializer.Serialize<MouseMessage>(message, ProtocolJson.Options);
+        var json = JsonSerializer.Serialize(message, ProtocolJsonContext.Default.MouseMessage);
         _ = _socket.SendAsync(
             Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
     }
@@ -223,8 +223,8 @@ public partial class MainWindow : Window
     private async Task ReceiveLoopAsync(ClientWebSocket socket)
     {
         // Server 保证先发送 Hello 再开始推帧
-        var hello = JsonSerializer.Deserialize<Hello>(
-            await ReceiveTextAsync(socket), ProtocolJson.Options)
+        var hello = JsonSerializer.Deserialize(
+            await ReceiveTextAsync(socket), ProtocolJsonContext.Default.Hello)
             ?? throw new InvalidDataException("Hello 解析失败");
         _textureSize = new Size(hello.Width, hello.Height);
         _rotation = hello.Rotation;
