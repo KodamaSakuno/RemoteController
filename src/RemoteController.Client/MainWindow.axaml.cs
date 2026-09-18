@@ -50,8 +50,6 @@ public partial class MainWindow : Window
     // 窗口锁定为画面宽高比：任何缩放都保持图像四边贴满、无黑边无变形（黑边逻辑仅作残差兜底）
     private void OnWindowSizeChanged(object? sender, SizeChangedEventArgs e)
     {
-        // 临时诊断：宽高填充问题定位后移除
-        Title = $"w={Bounds.Width:F0} h={Bounds.Height:F0} img={FrameImage.Bounds.Width:F0}x{FrameImage.Bounds.Height:F0} tex={_textureSize.Width:F0}x{_textureSize.Height:F0} r={_rotation} state={WindowState}";
         SnapWindowAspectTo(e.NewSize.Width);
     }
 
