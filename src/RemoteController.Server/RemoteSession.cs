@@ -6,9 +6,10 @@ using Windows.Win32;
 
 namespace RemoteController.Server;
 
-internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture, int quality)
+internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture, int quality, int maxFps)
 {
-    private static readonly TimeSpan MinFrameInterval = TimeSpan.FromMilliseconds(33); // 上限 30fps，duplication 变化可能更频繁
+    // 实际帧率 = min(MaxFps, 面板刷新率, CPU 可持续速度)；超出部分按既有背压策略丢弃
+    private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(1000.0 / Math.Clamp(maxFps, 1, 240));
 
     public async Task RunAsync()
     {
@@ -54,7 +55,7 @@ internal sealed class RemoteSession(WebSocket socket, DxgiCapture capture, int q
                     continue;
                 if (pending is { IsCompleted: false })
                     continue; // 网络积压时丢帧；也保证 encoder 缓冲不被未完成的发送读取
-                if (DateTime.UtcNow - lastSent < MinFrameInterval)
+                if (DateTime.UtcNow - lastSent < _minFrameInterval)
                     continue; // 帧率上限，超出部分丢弃（duplication 会聚合后续变化）
 
                 encoder.Encode(payload, capture.Width, capture.Height);

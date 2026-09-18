@@ -23,6 +23,7 @@ if (regionValue is not null && !CaptureRegion.TryParse(regionValue, out region))
 }
 
 var quality = builder.Configuration.GetValue("Quality", 75);
+var maxFps = builder.Configuration.GetValue("MaxFps", 30);
 
 // --dump-frame <path.bmp>：抓一帧直接落盘，用于 box 联调时查看服务端实际送出的像素，不启动 Web 服务
 var dumpPath = ConfigurationValue(args, "--dump-frame");
@@ -70,7 +71,7 @@ app.Map("/ws", async context =>
     }
 
     using var socket = await context.WebSockets.AcceptWebSocketAsync();
-    await new RemoteSession(socket, capture, quality).RunAsync();
+    await new RemoteSession(socket, capture, quality, maxFps).RunAsync();
 });
 
 app.Run();
