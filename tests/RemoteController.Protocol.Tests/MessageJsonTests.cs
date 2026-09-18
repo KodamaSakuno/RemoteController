@@ -34,4 +34,16 @@ public class MessageJsonTests
 
         Assert.Equal(message, JsonSerializer.Deserialize<MouseMessage>(json, ProtocolJson.Options));
     }
+
+    [Theory]
+    [InlineData(1.0)]
+    [InlineData(-1.0)]
+    [InlineData(0.125)] // 触控板精细滚动的小数增量
+    public void MouseWheelRoundTrips(double delta)
+    {
+        MouseMessage message = new MouseWheel(delta);
+        var json = JsonSerializer.Serialize(message, ProtocolJson.Options);
+
+        Assert.Equal(message, JsonSerializer.Deserialize<MouseMessage>(json, ProtocolJson.Options));
+    }
 }
