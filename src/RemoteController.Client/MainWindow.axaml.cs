@@ -51,12 +51,31 @@ public partial class MainWindow : Window
     private void OnWindowSizeChanged(object? sender, SizeChangedEventArgs e)
     {
         SnapWindowAspectTo(e.NewSize.Width);
+        FitImageControl();
     }
 
-    // 地址栏显隐变化后重新贴合宽高比
+    // 地址栏显隐变化后重新贴合
     private void SnapWindowAspect()
     {
         SnapWindowAspectTo(Bounds.Width);
+        FitImageControl();
+    }
+
+    // 图像控件按纹理（未旋转）比例设定：旋转后的视觉尺寸 = 纹理高×scale × 纹理宽×scale，恰好填满单元格。
+    // 若让 Uniform 直接把竖纹理适配进横向单元格，黑边会被 RenderTransform 一起旋转成上下白条。
+    private void FitImageControl()
+    {
+        if (_textureSize is { Width: <= 0 } or { Height: <= 0 })
+            return;
+
+        var cellWidth = Bounds.Width - 16;   // 与 SnapWindowAspectTo 的估算常量保持一致
+        var cellHeight = Bounds.Height - (ControlBar.IsVisible ? 74 : 32);
+        var scale = Math.Min(cellWidth / _textureSize.Height, cellHeight / _textureSize.Width);
+
+        _adjustingSize = true;
+        FrameImage.Width = _textureSize.Width * scale;
+        FrameImage.Height = _textureSize.Height * scale;
+        _adjustingSize = false;
     }
 
     private void SnapWindowAspectTo(double windowWidth)
