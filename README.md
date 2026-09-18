@@ -4,6 +4,8 @@
 
 局域网远程控制工具：在 PC 上显示并操作 Windows 平板（高通 ARM64）屏幕的指定区域，平板跑游戏，PC 当显示器和键鼠。
 
+![macOS 客户端实时显示平板桌面](docs/images/client-macos.jpg)
+
 ## 架构
 
 两端进程 + WebSocket over LAN：
@@ -15,6 +17,17 @@
 | `src/RemoteController.Protocol` | 共享 | 帧头与消息协议，两端共用 |
 
 特性：变化驱动（屏幕静止时零 CPU 零流量）、区域采集（`--region`）、JPEG 编码（quality 可配）、横竖屏自适应（旋转在客户端呈现）、鼠标回控（绝对坐标注入）。
+
+## 实测性能
+
+高通骁龙 Windows 平板，60fps 配置，Process Explorer 实测：
+
+| 场景 | Server CPU | 内存 |
+|---|---|---|
+| 屏幕静止 | ~0.09% | 45 MB |
+| 战斗动画（满帧推流） | ~5.6% | — |
+
+变化驱动架构：屏幕无更新时零采集、零编码、零网络流量；有更新时按 `MaxFps` 上限推流，超出部分丢帧保实时。
 
 架构决策详见 [docs/adr/0001-architecture.md](docs/adr/0001-architecture.md)。
 
