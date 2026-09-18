@@ -4,7 +4,7 @@
 
 局域网远程控制工具：在 PC 上显示并操作 Windows 平板（高通 ARM64）屏幕的指定区域，平板跑游戏，PC 当显示器和键鼠。
 
-![macOS 客户端实时显示平板桌面](docs/images/client-macos.jpg)
+![上：macOS 客户端；下：被控的高通 Windows 平板——同一画面](docs/images/setup.jpg)
 
 ## 架构
 
