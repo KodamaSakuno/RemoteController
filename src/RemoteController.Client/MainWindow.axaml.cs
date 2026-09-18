@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.IO;
 using System.Net.WebSockets;
 using System.Text;
@@ -254,10 +255,17 @@ public partial class MainWindow : Window
             if (!FrameHeader.TryParse(headerBuffer, out var header))
                 throw new InvalidDataException("帧头解析失败");
 
-            var payload = new byte[header.PayloadLength];
-            await ReadExactAsync(socket, payload);
-
-            await Dispatcher.UIThread.InvokeAsync(() => HandleFrame(header, payload));
+            // 负载 >85KB 会进 LOH，逐帧 new 会周期性触发 Gen2；从 ArrayPool 借还
+            var payload = ArrayPool<byte>.Shared.Rent(header.PayloadLength);
+            try
+            {
+                await ReadExactAsync(socket, payload.AsMemory(0, header.PayloadLength));
+                await Dispatcher.UIThread.InvokeAsync(() => HandleFrame(header, payload, header.PayloadLength));
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(payload);
+            }
         }
     }
 
@@ -290,15 +298,17 @@ public partial class MainWindow : Window
         }
     }
 
-    private void HandleFrame(FrameHeader header, byte[] payload)
+    private void HandleFrame(FrameHeader header, byte[] payload, int payloadLength)
     {
         _frameCount++;
         StatusText.Text = $"帧 #{_frameCount}";
 
-        // 每帧解码新位图：解码由 Skia 完成，替换 Source 即触发重绘
+        // 每帧解码新位图（Skia 在构造时同步完成解码），替换 Source 即触发重绘；
+        // 流须立即释放——payload 是 ArrayPool 借出的数组，返回后内容即失效
         _prevBitmap?.Dispose();
         _prevBitmap = _bitmap;
-        _bitmap = new Bitmap(new MemoryStream(payload, writable: false));
+        using (var stream = new MemoryStream(payload, 0, payloadLength, writable: false))
+            _bitmap = new Bitmap(stream);
         FrameImage.Source = _bitmap;
     }
 }
