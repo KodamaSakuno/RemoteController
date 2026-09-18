@@ -45,7 +45,15 @@ public partial class MainWindow : Window
         FrameImage.PointerMoved += OnPointerMoved;
         FrameImage.PointerPressed += OnPointerButton;
         FrameImage.PointerReleased += OnPointerButton;
+        FrameImage.PointerWheelChanged += OnPointerWheel;
         SizeChanged += OnWindowSizeChanged;
+    }
+
+    // 滚轮作用于服务端当前指针位置（随最后的 MouseMove），无需坐标映射
+    private void OnPointerWheel(object? sender, PointerWheelEventArgs e)
+    {
+        if (e.Delta.Y != 0)
+            Send(new MouseWheel(e.Delta.Y));
     }
 
     // 窗口锁定为画面宽高比：任何缩放都保持图像四边贴满、无黑边无变形（黑边逻辑仅作残差兜底）
