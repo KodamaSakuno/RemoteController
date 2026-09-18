@@ -20,7 +20,9 @@
 
 ## 要求
 
-- .NET 10 SDK（两端都是 Windows；Server 经 `win-arm64` 自包含发布可上 ARM 平板）
+- .NET 10 SDK
+- Server（被控端）：Windows（含 ARM64 平板；DXGI 依赖 Windows）
+- Client（控制端）：跨平台，Windows / macOS / Linux 均可（Avalonia，macOS 已实机验证）
 - 平板与 PC 同一局域网
 
 ## 运行
