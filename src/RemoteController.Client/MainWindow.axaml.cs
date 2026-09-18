@@ -22,6 +22,7 @@ public partial class MainWindow : Window
     private ClientWebSocket? _socket;
     private bool _connecting;      // 连接循环运行中（含重连等待）
     private bool _manualDisconnect; // 用户点「断开」后置位，终止重连循环
+    private bool _adjustingSize;   // 宽高比回写中，防 SizeChanged 递归
     private Bitmap? _bitmap;
     private Bitmap? _prevBitmap; // 渲染管线可能仍持有上一帧，延迟一帧再释放
     private Size _textureSize;   // 帧的纹理尺寸（hello.Width/Height，未旋转）
@@ -43,6 +44,40 @@ public partial class MainWindow : Window
         FrameImage.PointerMoved += OnPointerMoved;
         FrameImage.PointerPressed += OnPointerButton;
         FrameImage.PointerReleased += OnPointerButton;
+        SizeChanged += OnWindowSizeChanged;
+    }
+
+    // 窗口锁定为画面宽高比：任何缩放都保持图像四边贴满、无黑边无变形（黑边逻辑仅作残差兜底）
+    private void OnWindowSizeChanged(object? sender, SizeChangedEventArgs e)
+    {
+        SnapWindowAspectTo(e.NewSize.Width);
+    }
+
+    // 地址栏显隐变化后重新贴合宽高比
+    private void SnapWindowAspect()
+    {
+        SnapWindowAspectTo(Bounds.Width);
+    }
+
+    private void SnapWindowAspectTo(double windowWidth)
+    {
+        if (_adjustingSize || WindowState != WindowState.Normal
+            || _textureSize is { Width: <= 0 } or { Height: <= 0 })
+            return;
+
+        var rotated = _rotation is 90 or 270;
+        var aspect = rotated
+            ? _textureSize.Height / _textureSize.Width  // 逻辑宽/高 = 纹理高/宽（转置）
+            : _textureSize.Width / _textureSize.Height;
+
+        var chrome = ControlBar.IsVisible ? 74 : 32; // 标题栏 + 地址栏（显示时）
+        var targetHeight = (windowWidth - 16) / aspect + chrome; // 16 ≈ 左右边框
+        if (Math.Abs(Height - targetHeight) < 2)
+            return;
+
+        _adjustingSize = true;
+        Height = targetHeight;
+        _adjustingSize = false;
     }
 
     private void OnPointerMoved(object? sender, PointerEventArgs e)
@@ -55,6 +90,7 @@ public partial class MainWindow : Window
     private void OnFrameDoubleTapped(object? sender, TappedEventArgs e)
     {
         ControlBar.IsVisible = !ControlBar.IsVisible;
+        SnapWindowAspect();
     }
 
     private void OnPointerButton(object? sender, PointerEventArgs e)
@@ -189,6 +225,7 @@ public partial class MainWindow : Window
 
         StatusText.Text = "已断开";
         ControlBar.IsVisible = true;
+        SnapWindowAspect();
     }
 
     private async Task ReceiveLoopAsync(ClientWebSocket socket)
@@ -223,6 +260,7 @@ public partial class MainWindow : Window
 
             StatusText.Text = $"已连接 {logicalWidth}x{logicalHeight} @{hello.Dpi}dpi (旋转 {_rotation}°)";
             ControlBar.IsVisible = false; // 连接后隐藏地址栏，双击画面唤出
+            SnapWindowAspect();
         });
 
         var headerBuffer = new byte[FrameHeader.Size];
