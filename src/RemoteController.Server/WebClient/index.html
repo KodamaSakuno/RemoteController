@@ -17,7 +17,7 @@
 <script>
 "use strict";
 // 坐标映射公式与桌面客户端 CoordinateMap 同源（C# 侧有单元测试背书），改动须同步。
-// 呈现结构等价桌面端：canvas 背板 = 纹理尺寸，CSS 盒 = 逻辑尺寸，CSS rotate 完成旋转。
+// 呈现结构等价桌面端：canvas 背板与 CSS 盒均为纹理尺寸，CSS rotate 完成旋转，视觉盒 = 逻辑尺寸。
 const stage = document.getElementById('stage');
 const canvas = document.getElementById('view');
 const statusEl = document.getElementById('status');
@@ -61,12 +61,13 @@ function handleHello(h) {
   status(`已连接 ${logW}x${logH} @${h.Dpi}dpi`);
 }
 
-// CSS 盒 = 逻辑宽高比，适配窗口（等价桌面端窗口宽高比锁定）
+// CSS 盒 = 纹理尺寸×scale（旋转前的元素本体），旋转后视觉盒 = 逻辑尺寸×scale 恰好铺满窗口。
+// 与桌面端约定一致：元素按纹理比例设定，逻辑比例属于旋转后的视觉（见 CoordinateMap/WindowFitter）。
 function layout() {
   if (!logW) return;
   const scale = Math.min(innerWidth / logW, innerHeight / logH);
-  canvas.style.width = logW * scale + 'px';
-  canvas.style.height = logH * scale + 'px';
+  canvas.style.width = texW * scale + 'px';
+  canvas.style.height = texH * scale + 'px';
 }
 addEventListener('resize', layout);
 

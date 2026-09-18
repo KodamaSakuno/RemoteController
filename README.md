@@ -16,7 +16,7 @@
 | `src/RemoteController.Client` | 控制端（PC） | Avalonia UI：解码显示（旋转自适应）、鼠标/按键转发、断线自动重连 |
 | `src/RemoteController.Protocol` | 共享 | 帧头与消息协议，两端共用 |
 
-特性：变化驱动（屏幕静止时零 CPU 零流量）、区域采集（`--region`）、JPEG 编码（quality 可配）、横竖屏自适应（旋转在客户端呈现）、鼠标回控（绝对坐标注入）。
+特性：变化驱动（屏幕静止时零 CPU 零流量）、区域采集（`--region`）、JPEG 编码（quality 可配）、横竖屏自适应（旋转在客户端呈现）、鼠标回控（移动/按键/滚轮）、60fps 可配。控制端三形态：桌面客户端（Windows/macOS/Linux）、**任意设备浏览器**（`http://平板IP:5080/`，内嵌网页，触屏长按=右键）、两者共用同一 WebSocket 协议。
 
 ## 实测性能
 
@@ -58,7 +58,13 @@ dotnet run --project src/RemoteController.Server
 
 优先级：命令行 > `appsettings.json` > 缺省值。
 
-控制端（PC）：
+控制端（PC 或手机浏览器，零安装）：
+
+```
+http://<平板IP>:5080/
+```
+
+控制端（桌面客户端，Windows/macOS/Linux）：
 
 ```bash
 dotnet run --project src/RemoteController.Client -- <平板IP或主机名>

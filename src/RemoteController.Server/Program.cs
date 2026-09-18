@@ -103,7 +103,12 @@ static async Task<int> RunAsync(string? cliRegion, string? cliUrls, int? cliQual
     }
     if (webHtml is not null)
     {
-        app.MapGet("/", () => Results.Content(webHtml, "text/html; charset=utf-8"));
+        // no-cache：页面内嵌于二进制随版本更新，避免浏览器缓存旧控制端
+        app.MapGet("/", (HttpContext context) =>
+        {
+            context.Response.Headers.CacheControl = "no-cache";
+            return Results.Content(webHtml, "text/html; charset=utf-8");
+        });
         app.MapGet("/index.html", () => Results.Redirect("/"));
         app.MapGet("/favicon.ico", () => Results.NoContent());
     }
