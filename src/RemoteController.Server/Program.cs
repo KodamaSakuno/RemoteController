@@ -93,6 +93,21 @@ static async Task<int> RunAsync(string? cliRegion, string? cliUrls, int? cliQual
     // 单一采集实例供当前唯一客户端复用，避免每连接重复建 D3D 资源
     using var capture = new DxgiCapture(region);
 
+    // 内嵌 web 控制端：与桌面客户端共用同一 WS 协议的浏览器消费者，页面随二进制分发
+    const string webClientResource = "RemoteController.Server.WebClient.index.html";
+    string? webHtml = null;
+    await using (var stream = typeof(Program).Assembly.GetManifestResourceStream(webClientResource))
+    {
+        if (stream is not null)
+            webHtml = await new StreamReader(stream).ReadToEndAsync(cancellationToken);
+    }
+    if (webHtml is not null)
+    {
+        app.MapGet("/", () => Results.Content(webHtml, "text/html; charset=utf-8"));
+        app.MapGet("/index.html", () => Results.Redirect("/"));
+        app.MapGet("/favicon.ico", () => Results.NoContent());
+    }
+
     app.Map("/ws", async context =>
     {
         if (!context.WebSockets.IsWebSocketRequest)

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>RemoteController</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; touch-action: none; }
+  #view { transform-origin: center center; }
+  #status { position: fixed; left: 8px; top: 8px; color: #9fd; font: 12px monospace; pointer-events: none; text-shadow: 0 0 4px #000; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="view"></canvas></div>
+<div id="status">连接中…</div>
+<script>
+"use strict";
+// 坐标映射公式与桌面客户端 CoordinateMap 同源（C# 侧有单元测试背书），改动须同步。
+// 呈现结构等价桌面端：canvas 背板 = 纹理尺寸，CSS 盒 = 逻辑尺寸，CSS rotate 完成旋转。
+const stage = document.getElementById('stage');
+const canvas = document.getElementById('view');
+const statusEl = document.getElementById('status');
+const ctx = canvas.getContext('2d');
+
+let ws;
+let texW = 0, texH = 0, rotation = 0, originX = 0, originY = 0, logW = 0, logH = 0;
+let moveCount = 0;
+
+function status(t) { statusEl.textContent = t; }
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onmessage = onMessage;
+  ws.onclose = () => { status('连接中断，2s 后重连…'); setTimeout(connect, 2000); };
+  ws.onerror = () => ws.close();
+}
+
+function onMessage(e) {
+  if (typeof e.data === 'string') { handleHello(JSON.parse(e.data)); return; }
+  const dv = new DataView(e.data);
+  if (e.data.byteLength < 16 || dv.getUint32(0, true) !== 0x31464352) return; // 'RCF1' 帧头
+  const w = dv.getInt32(4, true), h = dv.getInt32(8, true);
+  createImageBitmap(new Blob([e.data.slice(16)])).then(bmp => {
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    ctx.drawImage(bmp, 0, 0);
+    bmp.close();
+    if (++moveCount % 60 === 0) status(`已连接 ${logW}x${logH} · 帧 #${moveCount}`);
+  });
+}
+
+function handleHello(h) {
+  texW = h.Width; texH = h.Height; rotation = h.Rotation;
+  originX = h.X; originY = h.Y;
+  const rotated = rotation === 90 || rotation === 270;
+  logW = rotated ? h.Height : h.Width;
+  logH = rotated ? h.Width : h.Height;
+  canvas.style.transform = `rotate(${rotation}deg)`;
+  layout();
+  status(`已连接 ${logW}x${logH} @${h.Dpi}dpi`);
+}
+
+// CSS 盒 = 逻辑宽高比，适配窗口（等价桌面端窗口宽高比锁定）
+function layout() {
+  if (!logW) return;
+  const scale = Math.min(innerWidth / logW, innerHeight / logH);
+  canvas.style.width = logW * scale + 'px';
+  canvas.style.height = logH * scale + 'px';
+}
+addEventListener('resize', layout);
+
+// 视觉盒（旋转后）居中于 stage；getBoundingClientRect 对旋转元素只给 AABB，
+// 故相对中心逆旋转回控件本地空间，再做纹理→逻辑映射（守卫黑区）
+function mapPointer(clientX, clientY) {
+  const r = stage.getBoundingClientRect();
+  const visW = parseFloat(canvas.style.width), visH = parseFloat(canvas.style.height);
+  if (!visW || !visH) return null;
+  const dx = clientX - (r.left + r.width / 2), dy = clientY - (r.top + r.height / 2);
+  const rad = -rotation * Math.PI / 180;
+  const rx = dx * Math.cos(rad) - dy * Math.sin(rad);
+  const ry = dx * Math.sin(rad) + dy * Math.cos(rad);
+  const u = rx / visW + 0.5, v = ry / visH + 0.5;
+  if (u < 0 || u > 1 || v < 0 || v > 1) return null;
+  const tw = u * texW, th = v * texH;
+  let lx, ly;
+  switch (rotation) {
+    case 90:  lx = texH - 1 - th; ly = tw; break;
+    case 270: lx = th; ly = texW - 1 - tw; break;
+    case 180: lx = texW - 1 - tw; ly = texH - 1 - th; break;
+    default:  lx = tw; ly = th;
+  }
+  return { X: originX + (lx | 0), Y: originY + (ly | 0) };
+}
+
+function send(msg) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+
+const Buttons = { 0: 'Left', 1: 'Middle', 2: 'Right' };
+
+stage.addEventListener('pointermove', e => {
+  if (longPressTimer && lpStart) {
+    const p = mapPointer(e.clientX, e.clientY);
+    if (!p || Math.abs(p.X - lpStart.X) > 8 || Math.abs(p.Y - lpStart.Y) > 8) cancelLongPress();
+  }
+  const p = mapPointer(e.clientX, e.clientY);
+  if (p) send({ kind: 'move', X: p.X, Y: p.Y });
+});
+stage.addEventListener('pointerdown', e => {
+  const p = mapPointer(e.clientX, e.clientY);
+  if (!p) return;
+  stage.setPointerCapture(e.pointerId);
+  cancelLongPress();
+  if (e.pointerType === 'touch') startLongPress(p);
+  else send({ kind: 'button', Button: Buttons[e.button] ?? 'Left', IsDown: true });
+});
+stage.addEventListener('pointerup', e => {
+  if (e.pointerType === 'touch') {
+    cancelLongPress();
+    // 长按已触发右键则补右键抬起，否则本次触摸按左键处理
+    if (longPressFired) { send({ kind: 'button', Button: 'Right', IsDown: false }); longPressFired = false; }
+    else send({ kind: 'button', Button: 'Left', IsDown: false });
+    return;
+  }
+  send({ kind: 'button', Button: Buttons[e.button] ?? 'Left', IsDown: false });
+});
+stage.addEventListener('pointercancel', cancelLongPress);
+// 浏览器 deltaY 向下为正，协议 Delta 向上为正，取反；约 100 像素 = 1 格
+stage.addEventListener('wheel', e => { e.preventDefault(); send({ kind: 'wheel', Delta: -e.deltaY / 100 }); }, { passive: false });
+stage.addEventListener('contextmenu', e => e.preventDefault());
+
+// 触屏无右键键，长按 500ms 触发右键（移动超阈值取消）
+let longPressTimer = null, longPressFired = false, lpStart = null;
+function startLongPress(p) {
+  longPressFired = false;
+  lpStart = p;
+  longPressTimer = setTimeout(() => {
+    longPressFired = true;
+    send({ kind: 'button', Button: 'Right', IsDown: true });
+  }, 500);
+}
+function cancelLongPress() { clearTimeout(longPressTimer); longPressTimer = null; lpStart = null; }
+
+connect();
+</script>
+</body>
+</html>
