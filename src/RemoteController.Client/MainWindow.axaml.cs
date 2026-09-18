@@ -51,6 +51,12 @@ public partial class MainWindow : Window
             Send(new MouseMove(x, y));
     }
 
+    // 连接后地址栏隐藏，双击画面唤出以操作「断开」
+    private void OnFrameDoubleTapped(object? sender, TappedEventArgs e)
+    {
+        ControlBar.IsVisible = !ControlBar.IsVisible;
+    }
+
     private void OnPointerButton(object? sender, PointerEventArgs e)
     {
         var updateKind = e.GetCurrentPoint(FrameImage).Properties.PointerUpdateKind;
@@ -179,6 +185,7 @@ public partial class MainWindow : Window
         }
 
         StatusText.Text = "已断开";
+        ControlBar.IsVisible = true;
     }
 
     private async Task ReceiveLoopAsync(ClientWebSocket socket)
@@ -215,6 +222,7 @@ public partial class MainWindow : Window
             FrameImage.RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative);
 
             StatusText.Text = $"已连接 {logicalWidth}x{logicalHeight} @{hello.Dpi}dpi (旋转 {_rotation}°)";
+            ControlBar.IsVisible = false; // 连接后隐藏地址栏，双击画面唤出
         });
 
         var headerBuffer = new byte[FrameHeader.Size];
