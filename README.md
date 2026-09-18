@@ -44,11 +44,19 @@
 
 ```bash
 dotnet run --project src/RemoteController.Server
-# 可选：只采集指定区域（物理像素，相对虚拟屏幕原点）
-dotnet run --project src/RemoteController.Server -- --region 0,0,1600,900
 ```
 
-配置也可写进 `src/RemoteController.Server/appsettings.json`（`Urls` / `Region` / `Quality`），命令行优先。
+命令行参数全集（`--help` 查看）：
+
+| 参数 | 说明 | 配置对应 |
+|---|---|---|
+| `--region x,y,w,h` | 只采集指定区域（物理像素，相对虚拟屏幕原点） | `Region` |
+| `--urls <地址>` | 监听地址 | `Urls` |
+| `--quality <1-100>` | JPEG 质量 | `Quality` |
+| `--max-fps <N>` | 帧率上限 | `MaxFps` |
+| `--dump-frame <路径>` | 抓一帧写 BMP 后退出（诊断） | 无 |
+
+优先级：命令行 > `appsettings.json` > 缺省值。
 
 控制端（PC）：
 
