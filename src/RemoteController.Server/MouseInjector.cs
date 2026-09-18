@@ -29,12 +29,16 @@ internal static class MouseInjector
                 // 按键事件不带坐标，沿用系统当前指针位置
                 Send(flags, 0, 0);
                 break;
+            case MouseWheel(var delta):
+                // WHEEL_DELTA=120 每格；触控板小数增量按原始精度注入
+                Send(MOUSE_EVENT_FLAGS.MOUSEEVENTF_WHEEL, 0, 0, (int)(delta * 120));
+                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(message));
         }
     }
 
-    private static unsafe void Send(MOUSE_EVENT_FLAGS flags, int x, int y)
+    private static unsafe void Send(MOUSE_EVENT_FLAGS flags, int x, int y, int data = 0)
     {
         if ((uint)x >= VirtualWidth || (uint)y >= VirtualHeight)
             throw new ArgumentOutOfRangeException(nameof(x), "注入坐标超出虚拟屏幕范围");
@@ -56,6 +60,7 @@ internal static class MouseInjector
                     dwFlags = flags,
                     dx = x,
                     dy = y,
+                    mouseData = (uint)data,
                 },
             },
         };
