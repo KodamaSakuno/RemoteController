@@ -61,8 +61,7 @@ public partial class MainWindow : Window
         FitImageControl();
     }
 
-    // 图像控件按纹理（未旋转）比例设定：旋转后的视觉尺寸 = 纹理高×scale × 纹理宽×scale，恰好填满单元格。
-    // 若让 Uniform 直接把竖纹理适配进横向单元格，黑边会被 RenderTransform 一起旋转成上下白条。
+    // 图像控件按纹理（未旋转）比例设定：旋转后的视觉尺寸恰好填满单元格（见 WindowFitter.ImageScale 的禁令）。
     private void FitImageControl()
     {
         if (_textureSize is { Width: <= 0 } or { Height: <= 0 })
@@ -70,7 +69,7 @@ public partial class MainWindow : Window
 
         var cellWidth = Bounds.Width - 16;   // 与 SnapWindowAspectTo 的估算常量保持一致
         var cellHeight = Bounds.Height - (ControlBar.IsVisible ? 74 : 32);
-        var scale = Math.Min(cellWidth / _textureSize.Height, cellHeight / _textureSize.Width);
+        var scale = WindowFitter.ImageScale(cellWidth, cellHeight, _textureSize);
 
         _adjustingSize = true;
         FrameImage.Width = _textureSize.Width * scale;
@@ -84,13 +83,8 @@ public partial class MainWindow : Window
             || _textureSize is { Width: <= 0 } or { Height: <= 0 })
             return;
 
-        var rotated = _rotation is 90 or 270;
-        var aspect = rotated
-            ? _textureSize.Height / _textureSize.Width  // 逻辑宽/高 = 纹理高/宽（转置）
-            : _textureSize.Width / _textureSize.Height;
-
         var chrome = ControlBar.IsVisible ? 74 : 32; // 标题栏 + 地址栏（显示时）
-        var targetHeight = (windowWidth - 16) / aspect + chrome; // 16 ≈ 左右边框
+        var targetHeight = WindowFitter.TargetHeight(windowWidth, _textureSize, _rotation, chrome);
         if (Math.Abs(Height - targetHeight) < 2)
             return;
 
@@ -136,39 +130,9 @@ public partial class MainWindow : Window
 
     private bool TryMapToServer(PointerEventArgs e, out int x, out int y)
     {
-        x = y = 0;
-        if (_textureSize is { Width: <= 0 } or { Height: <= 0 })
-            return false;
-
-        // Bounds 是控件本地空间（纹理方向）；Uniform 拉伸下位图在其中居中且保比例，扣除黑边后归一化
-        var bounds = FrameImage.Bounds;
-        if (bounds.Width <= 0 || bounds.Height <= 0)
-            return false;
-
-        var position = e.GetPosition(FrameImage);
-        var scale = Math.Min(bounds.Width / _textureSize.Width, bounds.Height / _textureSize.Height);
-        var renderedWidth = _textureSize.Width * scale;
-        var renderedHeight = _textureSize.Height * scale;
-        var u = (position.X - (bounds.Width - renderedWidth) / 2) / renderedWidth;
-        var v = (position.Y - (bounds.Height - renderedHeight) / 2) / renderedHeight;
-        if (u is < 0 or > 1 || v is < 0 or > 1)
-            return false; // 落在信箱黑边内，不产生注入
-
-        // 纹理 → 逻辑（与服务端 logical→texture 公式互逆）
-        var tw = (int)(u * _textureSize.Width);
-        var th = (int)(v * _textureSize.Height);
-        var (lx, ly) = _rotation switch
-        {
-            90 => (_textureSize.Height - 1 - th, tw),
-            270 => (th, _textureSize.Width - 1 - tw),
-            180 => (_textureSize.Width - 1 - tw, _textureSize.Height - 1 - th),
-            _ => (tw, th),
-        };
-
-        // 逻辑像素 + 区域原点 = 虚拟屏幕绝对物理像素
-        x = _regionOriginX + (int)lx;
-        y = _regionOriginY + (int)ly;
-        return true;
+        return CoordinateMap.TryMapPointer(
+            e.GetPosition(FrameImage), FrameImage.Bounds, _textureSize, _rotation,
+            _regionOriginX, _regionOriginY, out x, out y);
     }
 
     private void Send(MouseMessage message)

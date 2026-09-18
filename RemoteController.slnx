@@ -5,6 +5,7 @@
     <Project Path="src/RemoteController.Server/RemoteController.Server.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/RemoteController.Client.Tests/RemoteController.Client.Tests.csproj" />
     <Project Path="tests/RemoteController.Protocol.Tests/RemoteController.Protocol.Tests.csproj" />
   </Folder>
 </Solution>

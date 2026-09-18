@@ -20,4 +20,8 @@
   <ItemGroup>
     <ProjectReference Include="..\RemoteController.Protocol\RemoteController.Protocol.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="RemoteController.Client.Tests" />
+  </ItemGroup>
 </Project>
