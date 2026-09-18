@@ -43,8 +43,7 @@ internal static class MouseInjector
         if (flags.HasFlag(MOUSE_EVENT_FLAGS.MOUSEEVENTF_ABSOLUTE))
         {
             flags |= MOUSE_EVENT_FLAGS.MOUSEEVENTF_VIRTUALDESK;
-            x = x * 65535 / (VirtualWidth - 1);
-            y = y * 65535 / (VirtualHeight - 1);
+            (x, y) = VirtualCoordinates.Normalize(x, y, VirtualWidth, VirtualHeight);
         }
 
         var input = new INPUT

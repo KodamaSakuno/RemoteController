@@ -7,5 +7,6 @@
   <Folder Name="/tests/">
     <Project Path="tests/RemoteController.Client.Tests/RemoteController.Client.Tests.csproj" />
     <Project Path="tests/RemoteController.Protocol.Tests/RemoteController.Protocol.Tests.csproj" />
+    <Project Path="tests/RemoteController.Server.Tests/RemoteController.Server.Tests.csproj" />
   </Folder>
 </Solution>
