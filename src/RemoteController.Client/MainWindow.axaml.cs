@@ -85,16 +85,19 @@ public partial class MainWindow : Window
         if (_textureSize is { Width: <= 0 } or { Height: <= 0 })
             return false;
 
+        // Bounds 是控件本地空间（纹理方向）；Uniform 拉伸下位图在其中居中且保比例，扣除黑边后归一化
         var bounds = FrameImage.Bounds;
         if (bounds.Width <= 0 || bounds.Height <= 0)
             return false;
 
-        // GetPosition 已把指针逆变换到控件本地（纹理方向）坐标，无需再手动逆旋转
         var position = e.GetPosition(FrameImage);
-        var u = position.X / bounds.Width;
-        var v = position.Y / bounds.Height;
+        var scale = Math.Min(bounds.Width / _textureSize.Width, bounds.Height / _textureSize.Height);
+        var renderedWidth = _textureSize.Width * scale;
+        var renderedHeight = _textureSize.Height * scale;
+        var u = (position.X - (bounds.Width - renderedWidth) / 2) / renderedWidth;
+        var v = (position.Y - (bounds.Height - renderedHeight) / 2) / renderedHeight;
         if (u is < 0 or > 1 || v is < 0 or > 1)
-            return false; // 落在旋转后视觉的黑区，不产生注入
+            return false; // 落在信箱黑边内，不产生注入
 
         // 纹理 → 逻辑（与服务端 logical→texture 公式互逆）
         var tw = (int)(u * _textureSize.Width);
@@ -206,7 +209,7 @@ public partial class MainWindow : Window
 
         await Dispatcher.UIThread.InvokeAsync(() =>
         {
-            // 初始尺寸按逻辑宽高比适配屏幕工作区；超出屏幕会被系统钳制产生黑边
+            // 初始窗口按逻辑宽高比适配屏幕工作区；超出屏幕会被系统钳制产生黑边
             const double chrome = 60; // 地址栏 + 标题栏余量
             var area = (Screens.ScreenFromWindow(this)?.WorkingArea).GetValueOrDefault();
             var scale = area.Width > 0
@@ -215,9 +218,6 @@ public partial class MainWindow : Window
             Width = logicalWidth * scale;
             Height = (logicalHeight + chrome) * scale;
 
-            // 图像控件按纹理尺寸设定（位图同向，无变形），旋转交给 RenderTransform
-            FrameImage.Width = hello.Width * scale;
-            FrameImage.Height = hello.Height * scale;
             FrameImage.RenderTransform = new RotateTransform(_rotation);
             FrameImage.RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative);
 
